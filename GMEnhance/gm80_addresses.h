@@ -97,3 +97,20 @@
 #define ADDR_MIDDLE_CLICK_REL         0x18B190   // rel32 4 bytes -> middle-click stub
 #define ADDR_MIDDLE_CLICK_RET         0x18B2C2   // sub_58B0D0 exit point (stub returns here)
 #define ADDR_MIDDLE_CLICK_SHOW        0x1866F0   // sub_5866F0 show resource at caret
+
+// ==== Run-game pipeline (reverse-engineered for the mcp/ Node tool) ====
+// Run1Click/Debug1Click (menu "run normally"/"run in debug mode") are 8-byte
+// stubs into the shared pipeline; the only argument is AL (0 normal, 1 debug).
+// The localized IDE owner-draws its menu items (no caption text readable via
+// GetMenuString), but the VCL WM_COMMAND dispatch still works: posting the
+// item's command ID to TMainForm runs the real pipeline (verified live).
+// Pipeline flow: gate -> room check -> build temp exe -> CreateProcess + pump
+// IDE messages until the game exits -> delete the temp exe.
+#define ADDR_RUNGAME_PIPELINE         0x1DBEAC   // 0x5DBEAC (al=0 run / 1 debug)
+#define ADDR_MAINFORM_SLOT            0x20ADE8   // 0x60ADE8 -> TMainForm* (slot holds the form pointer)
+#define ADDR_PROJECT_PATH             0x1EA27C   // 0x5EA27C char* project path (GBK)
+#define ADDR_ROOMS_COUNT_GLOBAL       0x1E92A4   // 0x5E92A4 int room count
+// Run gate: TMainForm+0x57 must be non-zero or the pipeline silently returns.
+// No writer found for this byte yet; semantics pending runtime confirmation.
+// Zero rooms -> pipeline pops a GBK message stored at 0x5DBFE8.
+// "Run" submenu command IDs as shipped: 79 (run), 80 (debug).

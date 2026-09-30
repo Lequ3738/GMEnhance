@@ -38,3 +38,6 @@ cmake-build-*
 todo.txt
 desktop.ini
 *.user
+
+# mcp node deps
+mcp/node_modules/
