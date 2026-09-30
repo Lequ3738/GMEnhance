@@ -19,8 +19,10 @@
 // 用 ppid 归因，多 IDE 同时开游戏也不会误报。多个 IDE 在跑时必须用
 // instance 参数（序号或工程标题子串）指定目标，否则拒绝执行。
 //
-// 汉化版把菜单项全部设为自绘（MF_OWNERDRAW），叶子项读不到文本，但命令 ID
-// 与置灰状态可读："运行"子菜单固定两项，位置 0=运行、1=调试运行。
+// 下拉叶子项由 GM 自绘（MFT_OWNERDRAW，dwItemData 指向内部菜单对象）：文字和
+// 图标都是 GM 自己画出来的，Win32 菜单结构里不存文本，GetMenuStringW 返回空
+// （界面上看得到文字与此不矛盾），但命令 ID 与置灰状态可读。"运行"子菜单固定
+// 两项，位置 0=运行、1=调试运行。顶层菜单栏项是普通 STRING 项，文本可读。
 //
 // 两种用法：
 //   node server.mjs status|sync|run|debug|stop [--instance 序号|标题] [--timeout 毫秒]
@@ -30,6 +32,7 @@
 
 import process from 'node:process';
 import { spawn as nodeSpawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import path from 'node:path';
 import koffi from 'koffi';
@@ -151,7 +154,7 @@ function u16ArrayToStr(arr) {
   return String.fromCharCode(...arr.slice(0, end));
 }
 
-/** 读取菜单项文本；顶层 Caption 可读，汉化版叶子项为空（自绘） */
+/** 读取菜单项文本；顶层菜单栏项可读，下拉叶子项自绘、Win32 层不存文本返回空 */
 function menuText(hmenu, pos) {
   const buf = Buffer.alloc(512);
   const n = GetMenuStringW(hmenu, pos, buf, 256, MF_BYPOSITION);
@@ -204,8 +207,8 @@ export function findIdeWindows() {
 
 /**
  * 枚举"运行"顶层菜单的叶子项。
- * 顶层菜单按 运行/Run 模糊匹配（顶层 Caption 汉化版可读）；
- * 叶子项文本可能为空（自绘），命令 ID 与置灰状态始终可读。
+ * 顶层菜单按 运行/Run 模糊匹配（顶层菜单栏项是普通 STRING 项，Caption 可读）；
+ * 叶子项在 Win32 层不存文本（自绘，文字由 GM 绘制），命令 ID 与置灰状态始终可读。
  */
 export function inspectMenus(hwnd) {
   const hmenu = GetMenu(hwnd);
@@ -237,8 +240,8 @@ export function inspectMenus(hwnd) {
 
 /**
  * 从"运行"子菜单叶子项里挑出 运行 / 调试运行 两项。
- * 汉化版叶子项无文本：固定两项时按位置 0=运行、1=调试运行；
- * 有文本时（英文原版）按文本匹配，位置顺序兜底。
+ * 叶子项在 Win32 层无文本（自绘）：固定两项时按位置 0=运行、1=调试运行；
+ * 个别版本若真存有文本则按文本匹配，位置顺序兜底。
  */
 export function pickRunDebug(items) {
   if (items.length < 2) return null;
@@ -644,7 +647,268 @@ function finishStop(stopped, ide, ideIndex) {
   };
 }
 
-// ---------- 核心：IDE 生命周期（打开工程 / 关闭实例） ----------
+// ---------- action 库查询（解析 GM8 安装目录 lib\*.lib） ----------
+//
+// GM8 调色板上的每个 D&D 动作都来自 .lib 文件里的模板定义；对象 .gml 里
+// YYD ACTION 块的 lib_id/action_id 就是查这张表的键（7 个标准库 lib_id 全是 1，
+// action_id 按百位分库且全局唯一；两个汉化增强库 lib_id=740409）。
+// 格式来自 IDA 反编译（sub_4EB900 库级 / sub_4EB3F8 动作级），并与 IDE 进程
+// 内存里的模板库 262/262 条逐字段对照验证：
+//   lib:    u32 版本(500..520) → str 标题 → u32 lib_id → str 作者 → u32 ver2 →
+//           f64 日期 → str info → str website → u32 flag → u32 x52 →
+//           u32 count → count × action（文件尾无多余数据）
+//   action: u32 版本 → str caption → u32 id → 图标(u32 size + bytes) →
+//           u32 hidden → u32 advanced → [u32 若版本≥520] → str desc →
+//           str list_text → str hint → u32 kind → u32 palette_idx →
+//           u32 is_condition → u32 applies_to → u32 can_be_relative →
+//           u32 param_count → u32 槽容量(恒 8) → 槽容量×(str 标题, u32 类型,
+//           str 默认值, str 菜单项) → u32 exec_type → str 函数名/code → str strB
+// 布尔字段在文件里占 4 字节（读取函数 sub_4EA990 是 TStream.Read(...,4)），
+// 内存对象里才是 1 字节 Delphi Boolean（GMSave gm80_action_fill_in 按字节拷贝）。
+// 字符串 = u32 字节长 + GBK 内容，无结尾 NUL。
+
+const GM_ACTION_KIND_NAMES = {
+  0: '普通', 1: '分组开始', 2: '分组结束', 3: 'Else', 4: '退出事件',
+  5: 'Repeat', 6: '变量', 7: '执行代码', 8: '空占位', 9: '分隔线', 10: '分组标题',
+};
+const GM_ARG_TYPE_NAMES = {
+  0: '表达式', 1: '字符串', 2: '字符串或表达式', 3: '布尔', 4: '菜单',
+  5: '精灵', 6: '声音', 7: '背景', 8: '路径', 9: '脚本',
+  10: '物体', 11: '房间', 12: '字体', 13: '颜色', 14: '时间轴', 15: '字体描述串',
+};
+
+function parseLibAction(r) {
+  const version = r.u32();
+  if (version < 500 || version > 520) throw new Error(`动作版本 ${version} @0x${(r.pos - 4).toString(16)}`);
+  const a = { version, caption: r.str(), id: r.u32() };
+  const iconSize = r.u32();
+  r.bytes(iconSize); // 图标 BMP：查询不需要，跳过
+  a.hidden = r.u32() !== 0;
+  a.advanced = r.u32() !== 0;
+  if (version >= 520) r.u32(); // 版本 520 追加布尔
+  a.desc = r.str();      // 描述，常带 [action_xxx] 英文标签
+  a.list_text = r.str(); // 动作列表摘要（@N=参数值占位，@FI 等为格式标记）
+  a.hint = r.str();      // 参数编辑器提示（@w/@r/@N 标记）
+  a.kind = r.u32();
+  a.palette_idx = r.u32();
+  a.is_condition = r.u32() !== 0;
+  a.applies_to = r.u32() !== 0;
+  a.can_be_relative = r.u32() !== 0;
+  a.param_count = r.u32();
+  const slots = r.u32();
+  if (slots > 64) throw new Error(`参数槽容量异常 ${slots}`);
+  a.params = [];
+  for (let j = 0; j < slots; j++) {
+    const p = { caption: r.str(), type: r.u32(), def: r.str(), menu: r.str() };
+    if (j < a.param_count) a.params.push(p);
+  }
+  a.exec_type = r.u32(); // 0=无（IDE 硬编码转换） 1=函数 2=代码
+  a.fn_name = r.str();   // exec 1/2 时的函数名；kind 7 时为空（代码在动作实例里）
+  a.strB = r.str();
+  return a;
+}
+
+function parseLibFile(file) {
+  const buf = fs.readFileSync(file);
+  const r = {
+    buf, pos: 0,
+    u32() { const v = this.buf.readUInt32LE(this.pos); this.pos += 4; return v; },
+    f64() { const v = this.buf.readDoubleLE(this.pos); this.pos += 8; return v; },
+    str() {
+      const len = this.u32();
+      const s = gbkDecoder ? gbkDecoder.decode(this.buf.subarray(this.pos, this.pos + len)) : this.buf.toString('latin1', this.pos, this.pos + len);
+      this.pos += len;
+      return s;
+    },
+    bytes(n) { const b = this.buf.subarray(this.pos, this.pos + n); this.pos += n; return b; },
+  };
+  const version = r.u32();
+  if (version < 500 || version > 520) throw new Error(`库版本 ${version}`);
+  const lib = { version, caption: r.str(), lib_id: r.u32(), author: r.str() };
+  r.u32(); // ver2 (600)
+  r.f64(); // 日期
+  r.str(); // info
+  r.str(); // website
+  r.u32(); // flag
+  r.u32(); // x52
+  const count = r.u32();
+  lib.actions = [];
+  for (let i = 0; i < count; i++) {
+    const a = parseLibAction(r);
+    a.lib_file = path.basename(file);
+    a.lib_caption = lib.caption;
+    a.lib_id = lib.lib_id;
+    lib.actions.push(a);
+  }
+  return lib;
+}
+
+let g_actionLibs = null;
+
+/** 解析安装目录 lib\*.lib 并建索引；找不到时返回 { error } */
+export function loadActionLibs() {
+  if (g_actionLibs) return g_actionLibs;
+  const exe = findGameMakerExe();
+  if (!exe) return { error: '没找到 Game_Maker.exe（注册表与 Program Files 扫描都失败），无法定位 lib 目录' };
+  const libDir = path.join(path.dirname(exe), 'lib');
+  let files;
+  try {
+    files = fs.readdirSync(libDir).filter((f) => /\.lib$/i.test(f)).sort();
+  } catch {
+    return { error: `安装目录下没有 lib 文件夹：${libDir}` };
+  }
+  const libs = [];
+  for (const f of files) {
+    try {
+      libs.push(parseLibFile(path.join(libDir, f)));
+    } catch (e) {
+      return { error: `解析 ${f} 失败：${e.message}` };
+    }
+  }
+  const byId = new Map(); // action_id → [entry]（跨库同 id 如分隔线 999 会有多条）
+  for (const lib of libs)
+    for (const a of lib.actions) {
+      if (!byId.has(a.id)) byId.set(a.id, []);
+      byId.get(a.id).push(a);
+    }
+  g_actionLibs = { libDir, libs, byId };
+  return g_actionLibs;
+}
+
+const actionTag = (a) => (a.desc.match(/\[([a-z_0-9]+)\]/i) || [])[1] || null;
+
+/** YYD 参数值转义，与 GMSave 保存侧 encode_delimit 逐条对应 */
+function yydEscape(s) {
+  let out = String(s).replaceAll('\\', '\\\\').replaceAll('\r', '\\r').replaceAll('\n', '\\n');
+  out = out.replaceAll('*/', '*\\/');
+  return out;
+}
+
+/**
+ * 生成可粘贴的 YYD ACTION 块。字段集与 GMSave 保存侧（gm80_save.cpp）一致：
+ * relative 仅当模板 can_be_relative；applies_to 仅当模板 applies_to；
+ * kind 0 输出 invert + arg0..N；kind 5 输出 repeats；kind 6 输出 var_name/var_value；
+ * kind 7 无参数行，块后跟 GML 代码。argValues 缺省用库内默认值。
+ */
+export function yydActionBlock(a, argValues) {
+  const L = ['/*"/*\'/**//* YYD ACTION', `lib_id=${a.lib_id}`, `action_id=${a.id}`];
+  if (a.can_be_relative) L.push('relative=0');
+  if (a.applies_to) L.push('applies_to=self');
+  if (a.kind === 0) {
+    L.push('invert=0');
+    a.params.forEach((p, j) => L.push(`arg${j}=${yydEscape(argValues?.[j] ?? p.def)}`));
+  } else if (a.kind === 5) {
+    L.push(`repeats=${yydEscape(argValues?.[0] ?? a.params[0]?.def ?? '')}`);
+  } else if (a.kind === 6) {
+    L.push(`var_name=${yydEscape(argValues?.[0] ?? a.params[0]?.def ?? '')}`);
+    L.push(`var_value=${yydEscape(argValues?.[1] ?? a.params[1]?.def ?? '')}`);
+  }
+  L.push('*/');
+  // 与 GMSave 保存侧一致：块以 */ + CRLF 结尾；kind 7 的 GML 代码紧随其后
+  return L.join('\r\n') + '\r\n';
+}
+
+function actionDetailText(a) {
+  const tag = actionTag(a);
+  const kindName = GM_ACTION_KIND_NAMES[a.kind] ?? `未知(${a.kind})`;
+  const execName = a.kind === 7 ? '代码（GML 存在动作实例里）' : a.exec_type === 1 ? `函数 ${a.fn_name || '—'}` : a.exec_type === 2 ? (a.fn_name ? `代码包装 ${a.fn_name}` : '代码') : '无（IDE 按 id 硬编码转换）';
+  const lines = [];
+  lines.push(`动作 ${a.id}「${a.desc || a.caption}」${tag ? `（标签 ${tag}）` : ''} — ${a.lib_caption}（${a.lib_file}，lib_id=${a.lib_id}）`);
+  if (a.list_text && a.list_text !== a.desc) lines.push(`动作列表显示：${a.list_text}`);
+  if (a.hint) lines.push(`参数提示：${a.hint}`);
+  lines.push(`类型：${kindName}（kind ${a.kind}）｜执行：${execName}`);
+  lines.push(`适用对象(applies_to)：${a.applies_to ? '可选' : '无此概念'}｜可相对(relative)：${a.can_be_relative ? '是' : '否'}｜条件动作(question)：${a.is_condition ? '是' : '否'}${a.hidden ? '｜隐藏动作（调色板不显示）' : ''}`);
+  if (a.kind === 0 || a.kind === 5 || a.kind === 6) {
+    lines.push('参数：');
+    a.params.forEach((p, j) => {
+      const tn = GM_ARG_TYPE_NAMES[p.type] ?? `类型${p.type}`;
+      const menu = p.menu && p.menu !== 'item 1|item 2' ? ` 可选值: ${p.menu}` : '';
+      lines.push(`  arg${j} [${tn}] ${p.caption || '（无标题）'} 默认 ${JSON.stringify(p.def)}${menu}`);
+    });
+    if (!a.params.length) lines.push('  （无参数）');
+  } else {
+    lines.push('参数：无（该 kind 不走 arg0..N 参数行）');
+  }
+  lines.push('YYD ACTION 模板（可直接粘进对象 .gml 的事件段，参数值按需替换）：');
+  if (a.kind === 7) lines.push('(kind 7：模板之后直接接着写这个动作要执行的 GML 代码)');
+  lines.push(yydActionBlock(a));
+  return lines.join('\n');
+}
+
+function actionListText(libs) {
+  const lines = ['GM8 全部 D&D 动作（按库文件；编号查/名称查用 action_info 工具）：'];
+  for (const lib of libs) {
+    lines.push(`\n【${lib.caption}】${path.basename(lib.actions[0]?.lib_file ?? '')} — ${lib.actions.length} 项`);
+    for (const a of lib.actions) {
+      const kindName = GM_ACTION_KIND_NAMES[a.kind] ?? a.kind;
+      if (a.kind === 8) continue; // 空占位不列
+      const mark = a.kind === 9 || a.kind === 10 ? '— ' : '';
+      const tag = actionTag(a);
+      lines.push(`  ${mark}${a.id} ${a.desc || a.caption}${tag ? ` [${tag}]` : ''}（${kindName}${a.is_condition ? '/条件' : ''}${a.hidden ? '/隐藏' : ''}）`);
+    }
+  }
+  return lines.join('\n');
+}
+
+/**
+ * 查询动作：纯数字按 action_id（可能多条：分隔线 999 等跨库同 id），
+ * 其余按名称/英文标签/描述子串匹配（大小写不敏感）。
+ */
+export function queryActions(query) {
+  const al = loadActionLibs();
+  if (al.error) return { error: al.error };
+  const q = String(query).trim();
+  if (/^\d+$/.test(q)) {
+    return { matches: al.byId.get(Number(q)) ?? [] };
+  }
+  const needle = q.toLowerCase();
+  const matches = [];
+  for (const lib of al.libs)
+    for (const a of lib.actions) {
+      const tag = actionTag(a);
+      if (
+        (a.desc && a.desc.toLowerCase().includes(needle)) ||
+        (a.list_text && a.list_text.toLowerCase().includes(needle)) ||
+        (tag && tag.toLowerCase().includes(needle))
+      )
+        matches.push(a);
+    }
+  return { matches };
+}
+
+/**
+ * 生成 ACTIONS.md 知识库文档（全量动作表 + 每动作模板），写到 mcp 目录。
+ */
+function writeActionsMarkdown(outPath) {
+  const al = loadActionLibs();
+  if (al.error) throw new Error(al.error);
+  const md = [];
+  md.push('# GM8 D&D 动作总表（自动生成，勿手改）');
+  md.push('');
+  md.push(`来源：GM8 安装目录 \`lib\\*.lib\`（${al.libs.length} 个文件，共 ${al.libs.reduce((n, l) => n + l.actions.length, 0)} 条模板），`);
+  md.push('由 `node server.mjs actions-md` 从二进制 .lib 解析生成。查询请用 MCP 工具 `action_info`。');
+  md.push('');
+  md.push('字段说明：`kind` 0=普通 1=分组开始 2=分组结束 3=Else 4=退出事件 5=Repeat 6=变量 7=执行代码 8=空占位 9=分隔线 10=分组标题；');
+  md.push('参数类型：0=表达式 1=字符串 2=字符串或表达式 3=布尔 4=菜单 5=精灵 6=声音 7=背景 8=路径 9=脚本 10=物体 11=房间 12=字体 13=颜色 14=时间轴 15=字体描述串。');
+  md.push('');
+  for (const lib of al.libs) {
+    md.push(`## ${lib.caption}（lib_id=${lib.lib_id}，${lib.actions.length} 项）`);
+    md.push('');
+    for (const a of lib.actions) {
+      if (a.kind === 8) continue;
+      const tag = actionTag(a);
+      md.push(`### ${a.id} ${a.desc || a.caption}${tag ? ` \`${tag}\`` : ''}`);
+      md.push('');
+      md.push('```');
+      md.push(actionDetailText(a));
+      md.push('```');
+      md.push('');
+    }
+  }
+  fs.writeFileSync(outPath, md.join('\n'), 'utf8');
+  return outPath;
+}
+
 
 /**
  * 定位 Game_Maker.exe：先读用户指明的注册表值
@@ -1098,15 +1362,50 @@ async function cliMain(argv) {
     console.log(JSON.stringify(r, null, 2));
     return r.code;
   }
+  if (cmd === 'action') {
+    const al = loadActionLibs();
+    if (al.error) {
+      console.error(al.error);
+      return 1;
+    }
+    const q = argv[1] && !argv[1].startsWith('--') ? argv[1] : null;
+    if (!q || argv.includes('--list')) {
+      console.log(actionListText(al.libs));
+      return 0;
+    }
+    const { matches, error } = queryActions(q);
+    if (error) {
+      console.error(error);
+      return 1;
+    }
+    if (!matches.length) {
+      console.error(`没找到动作：${q}`);
+      return 1;
+    }
+    if (matches.length > 1) {
+      console.log(`匹配到 ${matches.length} 条：`);
+      for (const a of matches)
+        console.log(`  ${a.id}「${a.desc || a.caption}」— ${a.lib_caption}（${a.lib_file}，kind=${a.kind}）`);
+      return 0;
+    }
+    console.log(actionDetailText(matches[0]));
+    return 0;
+  }
+  if (cmd === 'actions-md') {
+    const out = path.join(path.dirname(fileURLToPath(import.meta.url)), 'ACTIONS.md');
+    console.log(`已生成 ${writeActionsMarkdown(out)}`);
+    return 0;
+  }
   if (cmd === 'mcp-selftest') {
     await mcpSelftest();
     return 0;
   }
-  console.error('用法: node server.mjs status|project|sync|run|debug|stop|open <工程路径>|close [--instance 序号|标题] [--timeout 毫秒] [--pid 进程号] [--grace 毫秒] | mcp-selftest\n' +
+  console.error('用法: node server.mjs status|project|sync|run|debug|stop|open <工程路径>|close|action <编号|名称>|actions-md [--instance 序号|标题] [--timeout 毫秒] [--pid 进程号] [--grace 毫秒] | mcp-selftest\n' +
     '  sync 退出码: 0 已同步/无需同步; 5 需人工处理; 6 顺延/超时; 7 通道不可用\n' +
     '  stop 退出码: 0 已停止/无游戏; 5 有进程未能停止; 7 pid 不是正在运行的游戏\n' +
     '  open 退出码: 0 已启动并载入; 1 启动失败/exe 找不到; 6 超时; 7 路径参数无效\n' +
-    '  close 退出码: 0 已退出; 6 超时未退出（多半弹了保存确认框等人工）');
+    '  close 退出码: 0 已退出; 6 超时未退出（多半弹了保存确认框等人工）\n' +
+    '  action 退出码: 0 查到; 1 没找到/解析失败; actions-md 重新生成 ACTIONS.md');
   return 64;
 }
 
@@ -1140,7 +1439,7 @@ async function mcpMain() {
   const { StdioServerTransport } = await import('@modelcontextprotocol/sdk/server/stdio.js');
   const { z } = await import('zod');
 
-  const server = new McpServer({ name: 'gm8', version: '0.6.0' });
+  const server = new McpServer({ name: 'gm8', version: '0.7.0' });
   const commonSchema = {
     instance: z
       .union([z.number().int().min(1), z.string().min(1)])
@@ -1327,6 +1626,45 @@ async function mcpMain() {
       return {
         content: [{ type: 'text', text: lines.join('\n') + '\n```json\n' + JSON.stringify({ ...p, instance: briefInstance(ide, idx) }, null, 2) + '\n```' }],
       };
+    },
+  );
+
+  server.registerTool(
+    'action_info',
+    {
+      title: '查询 GM8 D&D 动作',
+      description:
+        '查 GameMaker 8.0 拖放动作（D&D Action）的定义与写法。数据来自 GM8 安装目录 lib\\*.lib ' +
+        '（与 IDE 调色板同源，262 条模板，已与 IDE 内存逐一对照验证）。三种用法：' +
+        '① 传编号（如 "603"）查它是哪个动作、参数含义；② 传名称子串（如 "执行代码"、"注释"、' +
+        '英文标签 "action_create_object"）搜索动作；③ 不传参数列出全部动作索引。' +
+        '返回中文名、英文标签、参数表（类型/标题/默认值）、以及可直接粘贴进对象 .gml 事件段的 ' +
+        'YYD ACTION 模板块（编辑对象动作时照它写，不用再猜 lib_id/action_id/字段格式）。' +
+        '注意：执行代码动作是 kind 7（块后直接跟 GML）；注释动作是 605（arg0=注释文字，' +
+        '在动作列表里显示为斜体）。',
+      inputSchema: {
+        query: z
+          .string()
+          .optional()
+          .describe('动作编号（"603"）或名称/英文标签子串（"执行代码"/"注释"/"action_create_object"）'),
+        list: z.boolean().optional().describe('true = 列出全部动作索引（忽略 query）'),
+      },
+    },
+    async ({ query, list }) => {
+      const al = loadActionLibs();
+      if (al.error) return toolResult({ ok: false, code: 1, reason: al.error });
+      if (list || !query) return { content: [{ type: 'text', text: actionListText(al.libs) }] };
+      const { matches, error } = queryActions(query);
+      if (error) return toolResult({ ok: false, code: 1, reason: error });
+      if (!matches.length)
+        return toolResult({ ok: false, code: 1, reason: `没找到动作：${query}（可传 list=true 看全部索引）` });
+      if (matches.length > 1) {
+        const lines = [`匹配到 ${matches.length} 条（用编号或更具体的名称缩小范围）：`];
+        for (const a of matches)
+          lines.push(`  ${a.id}「${a.desc || a.caption}」— ${a.lib_caption}（${a.lib_file}，kind=${a.kind}）`);
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+      }
+      return { content: [{ type: 'text', text: actionDetailText(matches[0]) }] };
     },
   );
 

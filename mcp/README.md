@@ -45,8 +45,10 @@ GM8 编译用的是 **IDE 内存里**的工程：外部工具改了磁盘上的 
 
 ### 两个实测过的平台事实
 
-- **汉化版菜单自绘化**：所有菜单项 `MF_OWNERDRAW`，`GetMenuString` 系列对叶子项返回空文本，
-  但命令 ID、置灰状态正常，`WM_COMMAND` 分派链完好——本工具因此按位置选叶子项而非文本。
+- **菜单叶子项自绘**：下拉叶子项全部 `MFT_OWNERDRAW`（顶层菜单栏项是普通 `STRING`、
+  文本可读）。文字与图标由 GM 自己绘制，Win32 菜单结构里**不存文本**，
+  `GetMenuString` 系列对叶子项返回空——界面上看得到文字与此不矛盾。
+  命令 ID、置灰状态正常，`WM_COMMAND` 分派链完好——本工具因此按位置选叶子项而非文本。
 - **编译耗时**：触发后 IDE 先构建临时 exe 再启动游戏（Nature Edition 实测约 14 秒），
   默认超时 30 秒，大工程可传 `timeout_ms` 调大。
 
@@ -88,6 +90,7 @@ npm install
 | `run_game` | `instance?`, `timeout_ms?` | 前置同步后触发"正常运行"（F5）；返回新游戏进程 PID |
 | `run_debug` | `instance?`, `timeout_ms?` | 前置同步后触发"调试运行"（F6） |
 | `stop_game` | `instance?` / `pid?`, `grace_ms?` | 关闭该 IDE 启动的全部游戏（或 pid 指定的一个）：先 WM_CLOSE 优雅退出（宽限期内每 150ms 补发，兼容刚启动还没出现窗口的游戏），超时才 TerminateProcess；没有游戏时是成功无操作（幂等） |
+| `action_info` | `query?`, `list?` | 查询 D&D 动作定义（数据源 = GM8 安装目录 `lib\*.lib`，262 条模板，已与 IDE 内存逐字段对照验证）：编号（"603"）查含义、名称/英文标签子串搜索（"执行代码"/"action_create_object"）、不传参数列全表。返回中文名、参数表（类型/标题/默认值）与可直接粘贴进对象 .gml 的 YYD ACTION 模板块。配套 `node server.mjs actions-md` 可重新生成全量速查文档 [ACTIONS.md](ACTIONS.md) |
 
 ### 工程格式：.gm80 与 .gmk
 
@@ -103,6 +106,12 @@ GM8 有两类工程，`get_project` / `status` 返回的 `format` 字段区分�
 
 ## 语义与边界
 
+- **动作定义数据源**：`action_info` 解析 GM8 安装目录 `lib\*.lib`（二进制格式，
+  经 IDA 反编译 IDE 加载函数 sub_4EB900/sub_4EB3F8 提取，并与 IDE 进程内存里的
+  模板库 262/262 条逐字段对照验证）。7 个标准库 lib_id 全为 1，动作 id 按百位
+  分库（1xx=移动 2xx=主要一 3xx=主要二 4xx/6xx=控制 5xx=绘制 7xx=分数 8xx=高级）
+  且全局唯一；两个汉化增强库 lib_id=740409。YYD ACTION 块的字段规则与 GMSave
+  保存侧（gm80_save.cpp）一致，生成块已对真实工程 441 个现存动作块逐字节复刻验证。
 - **前置同步**：`run_*` 先同步再触发。同步被拒（退出码 5：IDE 有未应用的修改/冲突需人工
   处理）或顺延/超时（退出码 6）时**不触发运行**——宁可不跑也不跑旧代码。
 - **停止游戏**：`stop_game` 按 ppid 只关目标 IDE 自己启动的游戏。WM_CLOSE 让游戏走正常
@@ -126,6 +135,9 @@ node server.mjs debug [--instance 序号|标题子串] [--timeout 毫秒]
 node server.mjs stop [--instance 序号|标题子串] [--pid 进程号] [--grace 毫秒]
 node server.mjs open <工程路径> [--timeout 毫秒]
 node server.mjs close [--instance 序号|标题子串] [--timeout 毫秒]
+node server.mjs action <编号|名称子串>       # 查 D&D 动作定义与 YYD ACTION 模板
+node server.mjs action --list               # 全部动作索引
+node server.mjs actions-md                  # 重新生成 ACTIONS.md 速查文档
 node server.mjs mcp-selftest        # 校验 MCP SDK 依赖
 ```
 

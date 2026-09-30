@@ -1,6 +1,6 @@
 {
   "name": "gm8-mcp",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "private": true,
   "type": "module",
   "description": "GameMaker 8.0 IDE 运行控制 MCP 服务器（纯外部方案：窗口消息 + 进程轮询 + GMSave 工程同步，零注入、零新增可执行文件）",
