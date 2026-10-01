@@ -1460,9 +1460,9 @@ async function mcpMain() {
     {
       title: 'GM8 IDE 状态',
       description:
-        '探测全部 GameMaker 8.0 IDE 实例（支持多开）：每个实例的序号/pid/标题（含工程名）、' +
-        '"运行"菜单叶子项的命令 ID/置灰状态、当前正在运行的 GM8 游戏进程（含归属 IDE 的 pid）。' +
-        '只读，无副作用。run_game/run_debug 之前可先调用确认实例与参数。',
+        '探测全部 GameMaker 8.0 IDE 实例，支持多开。返回每个实例的序号/pid/标题（含工程名）、' +
+        '"运行"菜单叶子项的命令 ID 与置灰状态、正在运行的 GM8 游戏进程及其归属 IDE 的 pid。' +
+        '只读，无副作用；run_game/run_debug 之前可先调用确认实例与参数。',
     },
     async () => {
       const r = status();
@@ -1477,13 +1477,13 @@ async function mcpMain() {
     {
       title: '同步 GM8 工程（外部改动重载）',
       description:
-        '让某个 IDE 实例里的 GMSave 插件立即检查磁盘上的 .gm80 工程改动并重载进 IDE 内存' +
-        '（跳过 GMSave 默认的"IDE 回到前台才处理"门控，专为 AI 后台改文件的闭环设计）。' +
-        'AI 改完工程文件后、run_game/run_debug 之前调用（run_* 已内置前置同步，' +
-        '仅在需要单独确认同步结果时才调这个）。无人值守安全：检测到会弹窗的状态' +
-        '（IDE 里有未应用修改、模态窗等）就拒绝并回报，不会弹出任何需要人回答的窗口。' +
+        '让某个 IDE 实例里的 GMSave 插件立即检查磁盘上的 .gm80 工程改动并重载进 IDE 内存，' +
+        '跳过 GMSave 默认的"IDE 回到前台才处理"门控，专为 AI 后台改文件的闭环设计。' +
+        'AI 改完工程文件后、run_game/run_debug 之前调用；run_* 已内置前置同步，' +
+        '仅需单独确认同步结果时才调这个。无人值守安全：检测到会弹窗的状态' +
+        '（IDE 有未应用修改、模态窗等）就拒绝并回报，不弹任何需要人回答的窗口。' +
         'status_gmsave 通道不可用说明 GMSave.dll 未部署或版本旧——此时重载不会发生，' +
-        '运行将使用 IDE 内存中的旧工程。需要 GMSave.dll。',
+        '运行将使用 IDE 内存中的旧工程。',
       inputSchema: commonSchema,
     },
     async ({ instance, timeout_ms }) => {
@@ -1542,10 +1542,9 @@ async function mcpMain() {
       title: '打开 GM8 工程（新 IDE 实例）',
       description:
         '启动一个新的 GameMaker 8.0 IDE 进程并打开指定工程（等同双击关联文件）。' +
-        '安装路径先读注册表 HKCU\\Software\\Game Maker\\Version 8\\Preferences\\Directory，' +
-        '读不到再扫描 Program Files (x86)。path 支持 .gmk/.gm6/.gmd 文件、.gm80 元数据文件、' +
-        '或 .gm80 工程文件夹（自动定位里面的同名元数据）。返回新实例 pid/标题/工程信息；' +
-        '以 GM80_ProjectPath 出现确认载入完成。多个 IDE 在跑时新实例会追加到实例列表末尾。' +
+        'path 支持 .gmk/.gm6/.gmd 文件、.gm80 元数据文件或 .gm80 工程文件夹' +
+        '（自动定位其中的同名元数据）。返回新实例 pid/标题/工程信息，' +
+        '以 GM80_ProjectPath 出现确认载入完成。多个 IDE 在跑时新实例追加到实例列表末尾；' +
         'detached 启动，MCP 进程退出不影响已打开的 IDE。',
       inputSchema: {
         path: z
@@ -1569,10 +1568,10 @@ async function mcpMain() {
     {
       title: '关闭 GM8 IDE 实例',
       description:
-        '请求某个 IDE 实例退出（WM_CLOSE，等同点 IDE 窗口的 X）。有未保存修改时 GM 会弹自己的' +
-        '保存确认对话框等人工处理——这是预期行为：工具关闭前会读 GM 的脏标志预检并把' +
-        'unsaved_changes 一并报告；超时未退出（退出码 6）即说明弹了窗需要人工处理。' +
-        'IDE 关闭不会停止它启动的游戏进程，可用 stop_games 参数先停游戏或之后用 stop_game。' +
+        '请求某个 IDE 实例退出（WM_CLOSE，等同点窗口的 X）。有未保存修改时 GM 会弹自己的' +
+        '保存确认对话框等人工处理，这是预期行为：工具关闭前读 GM 脏标志预检并报告 ' +
+        'unsaved_changes；超时未退出（退出码 6）即说明弹了窗，需人工处理。' +
+        'IDE 关闭不会停止它启动的游戏进程，可用 stop_games 参数先停游戏，或之后用 stop_game。' +
         '多个 IDE 在跑时必须传 instance。',
       inputSchema: {
         instance: commonSchema.instance,
@@ -1598,11 +1597,10 @@ async function mcpMain() {
     {
       title: '获取 GM8 当前工程',
       description:
-        '读取某个 IDE 实例当前打开的工程文件路径（纯外部：ReadProcessMemory 读 IDE 全局 ' +
-        'GM80_ProjectPath，GBK 解码）。返回 path（没打开工程时为 null）、format：' +
-        "'gm80' = GMSave 文本工程目录（AI 可直接编辑文件夹里的 .gml/.txt，配合 sync_project 同步）、" +
-        "'native' = .gmk/.gm6/.gmd 原生二进制（外部文件编辑与 sync_project 均不适用）、" +
-        "其他 = 未知；folder = 工程目录（.gm80 即受监视的文件夹）。status 里也带同样信息。",
+        '读取某个 IDE 实例当前打开的工程文件路径。返回 path（没打开工程时为 null）与 format：' +
+        "'gm80' = GMSave 文本工程目录，可直接编辑文件夹里的 .gml/.txt，配合 sync_project 同步；" +
+        "'native' = .gmk/.gm6/.gmd 原生二进制，外部文件编辑与 sync_project 均不适用；其他 = 未知。" +
+        'folder = 工程目录（.gm80 即受监视的文件夹）。status 里也带同样信息。',
       inputSchema: { instance: commonSchema.instance },
     },
     async ({ instance }) => {
@@ -1634,14 +1632,12 @@ async function mcpMain() {
     {
       title: '查询 GM8 D&D 动作',
       description:
-        '查 GameMaker 8.0 拖放动作（D&D Action）的定义与写法。数据来自 GM8 安装目录 lib\\*.lib ' +
-        '（与 IDE 调色板同源，262 条模板，已与 IDE 内存逐一对照验证）。三种用法：' +
-        '① 传编号（如 "603"）查它是哪个动作、参数含义；② 传名称子串（如 "执行代码"、"注释"、' +
-        '英文标签 "action_create_object"）搜索动作；③ 不传参数列出全部动作索引。' +
-        '返回中文名、英文标签、参数表（类型/标题/默认值）、以及可直接粘贴进对象 .gml 事件段的 ' +
-        'YYD ACTION 模板块（编辑对象动作时照它写，不用再猜 lib_id/action_id/字段格式）。' +
-        '注意：执行代码动作是 kind 7（块后直接跟 GML）；注释动作是 605（arg0=注释文字，' +
-        '在动作列表里显示为斜体）。',
+        '查 GameMaker 8.0 拖放动作（D&D Action）的定义与写法。数据来自 GM8 安装目录 lib\\*.lib，' +
+        '与 IDE 调色板同源，262 条模板。三种用法：① 传编号（如 "603"）查它是哪个动作、参数含义；' +
+        '② 传名称子串（如 "执行代码"、"注释"、英文标签 "action_create_object"）搜索动作；' +
+        '③ 不传参数列出全部动作索引。返回中文名、英文标签、参数表（类型/标题/默认值），' +
+        '以及可直接粘贴进对象 .gml 事件段的 YYD ACTION 模板块（照它写，不必猜 lib_id/action_id/字段格式）。' +
+        '执行代码动作是 kind 7（块后直接跟 GML）；注释动作是 605（arg0=注释文字，动作列表里显示为斜体）。',
       inputSchema: {
         query: z
           .string()
@@ -1675,8 +1671,8 @@ async function mcpMain() {
       description:
         '关闭某个 IDE 实例启动的全部 GM8 游戏进程：先给游戏窗口投递 WM_CLOSE（等同点窗口关闭按钮，' +
         '游戏走正常退出流程），宽限 grace_ms 毫秒仍没退出才 TerminateProcess 强杀。' +
-        '游戏由哪个 IDE 启动用 ppid 归因，只关该 IDE 自己的游戏；也可用 pid 只关指定进程。' +
-        '目标 IDE 没有游戏在跑时是成功无操作（幂等，适合循环收尾时无脑调用）。' +
+        '游戏归属用 ppid 归因，只关该 IDE 自己的游戏；也可用 pid 只关指定进程。' +
+        '目标 IDE 没有游戏在跑时是成功无操作，幂等，适合循环收尾时直接调用。' +
         '多个 IDE 在跑时必须传 instance（给了 pid 则不需要）。',
       inputSchema: {
         instance: commonSchema.instance,
@@ -1706,9 +1702,9 @@ async function mcpMain() {
       description:
         '触发某个 GameMaker 8.0 IDE 实例的"正常运行"（等同按 F5）。流程：先用 GMSave 把磁盘上' +
         '的外部改动同步进 IDE 内存（未部署 GMSave 则降级为警告继续），再给 IDE 主窗口投递 ' +
-        'WM_COMMAND，与用户点菜单同一条 VCL 路径。IDE 编译内存中的工程（Nature Edition 实测约 ' +
-        '14 秒）再启动游戏，成功返回新游戏进程 PID。多个 IDE 在跑时必须传 instance。' +
-        '退出码 5 = IDE 有未应用的修改/冲突需人工处理（未运行）；6 = 同步顺延/超时（未运行）；' +
+        'WM_COMMAND 触发编译运行（与用户点菜单同一条路径）。成功返回新游戏进程 PID，' +
+        '编译耗时参考 timeout_ms 说明。多个 IDE 在跑时必须传 instance。' +
+        '退出码：5 = IDE 有未应用的修改/冲突需人工处理（未运行）；6 = 同步顺延/超时（未运行）；' +
         '3 = 已触发但超时，大概率 IDE 弹了编译错误对话框等人工确认。',
       inputSchema: commonSchema,
     },
