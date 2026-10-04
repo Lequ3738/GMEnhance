@@ -1277,16 +1277,32 @@ export async function runGame(kind, timeoutMs = 30000, instance) {
 
 // ---------- save_project：触发 IDE"保存工程" ----------
 
+// IDE 进程是否有可见的模态对话框（#32770：MessageBox 系）。
+function modalDialogOpen(pid) {
+  for (let h = FindWindowExW(null, null, '#32770', null); h;
+       h = FindWindowExW(null, h, '#32770', null)) {
+    if (windowPid(h) === pid && IsWindowVisible(h)) return true;
+  }
+  return false;
+}
+
 // 在全部顶层子菜单里定位"文件 > 保存"的命令 ID。菜单项自绘无文本，不能按
-// 名字找；按结构签名找——高级模式文件菜单 = [新建, 打开, POPUP(历史记录),
-// SEP, 保存, SEP, ...]，取第一个含 POPUP 的顶层里 POPUP 之后的第一个非 SEP
-// 项。汉化版两套 TMainMenu（高级/简单）共用一个菜单栏，未激活的一套
-// （精简菜单）无 POPUP，签名天然排它。找不到时回退 id 0x10（高级模式保存，
-// 2026-10-04 运行时实测：触发后 GMSave 日志出现保存记录）。
+// 名字找。首选直接扫已实证的保存命令 ID 0x10（高级模式文件菜单"保存"）；
+// 找不到再退到结构签名——第一个含 POPUP 的顶层里 POPUP 之后的第一个非 SEP
+// 项。POPUP 判定必须放在分隔符之前：文件菜单的"历史记录"POPUP 同时带
+// MF_SEPARATOR|MF_POPUP（0xa10），先判分隔符会把它整个吃掉，签名就会落进
+// 帮助菜单（其 POPUP 无分隔位），错触发"新闻"项。
 export function pickSaveCommandId(hwnd) {
   const hmenu = GetMenu(hwnd);
   if (!hmenu) return null;
   const topCount = GetMenuItemCount(hmenu);
+  for (let i = 0; i < topCount; i++) {
+    const hsub = GetSubMenu(hmenu, i);
+    if (!hsub) continue;
+    const count = GetMenuItemCount(hsub);
+    for (let j = 0; j < count; j++)
+      if ((GetMenuItemID(hsub, j) >>> 0) === 0x10) return 0x10;
+  }
   for (let i = 0; i < topCount; i++) {
     const hsub = GetSubMenu(hmenu, i);
     if (!hsub) continue;
@@ -1296,20 +1312,11 @@ export function pickSaveCommandId(hwnd) {
     for (let j = 0; j < count; j++) {
       const id = GetMenuItemID(hsub, j) >>> 0;
       const st = GetMenuState(hsub, j, 0x400);
-      if (st & 0x800) continue; // separator
       if (st & 0x10) { sawPopup = true; afterPopup = -1; continue; }
+      if (st & 0x800) continue; // separator
       if (sawPopup && afterPopup < 0) afterPopup = id;
     }
     if (sawPopup && afterPopup > 0 && afterPopup !== 0xffffffff) return afterPopup;
-  }
-  // 回退：已知的保存命令 ID（高级模式文件菜单 leaf#4）
-  for (let i = 0; i < topCount; i++) {
-    const hsub = GetSubMenu(hmenu, i);
-    if (!hsub) continue;
-    const count = GetMenuItemCount(hsub);
-    for (let j = 0; j < count; j++) {
-      if ((GetMenuItemID(hsub, j) >>> 0) === 0x10) return 0x10;
-    }
   }
   return null;
 }
@@ -1337,9 +1344,22 @@ export async function saveProject(instance, timeoutMs = 60000) {
   }
   const ide = r.target;
 
+  // 提示框（保存冲突三选/错误框等，类名 #32770）打开期间再投保存命令，
+  // 保存钩子会在对话框的消息循环里重入并叠出第二个一模一样的提示——实测
+  // 连续三次触发叠了两个。无人值守调用应先处理对话框，拒绝比堆叠安全。
+  if (modalDialogOpen(ide.pid)) {
+    return {
+      ok: false, code: 5,
+      reason: 'IDE 有模态对话框处于打开状态（可能是保存冲突提示或错误框），' +
+        '再投保存命令会把保存流程重入并叠出新提示框',
+      hint: '先人工或经外部工具处理该对话框（确定/取消/是/否），再重试保存',
+      instance: briefInstance(ide, wins.indexOf(ide)),
+    };
+  }
+
   const id = pickSaveCommandId(ide.hwnd);
   if (id == null) {
-    return { ok: false, code: 2, reason: '菜单结构里没定位到"文件 > 保存"（结构签名与回退 id 都未命中）' };
+    return { ok: false, code: 2, reason: '菜单结构里没定位到"文件 > 保存"（已知 id 与结构签名都未命中）' };
   }
 
   const title0 = windowTitle(ide.hwnd);
@@ -1556,7 +1576,7 @@ async function mcpMain() {
   const { StdioServerTransport } = await import('@modelcontextprotocol/sdk/server/stdio.js');
   const { z } = await import('zod');
 
-  const server = new McpServer({ name: 'gm8', version: '0.8.0' });
+  const server = new McpServer({ name: 'gm8', version: '0.8.1' });
   const commonSchema = {
     instance: z
       .union([z.number().int().min(1), z.string().min(1)])
@@ -1846,10 +1866,11 @@ async function mcpMain() {
       title: '保存 GM8 工程',
       description:
         '触发某个 GameMaker 8.0 IDE 实例的"保存工程"（等同 Ctrl+S）：给 IDE 主窗口投递 ' +
-        'WM_COMMAND 到"文件 > 保存"菜单项（免前台，IDE 在后台也能保存）。按结构签名定位' +
-        '保存项，回退已知命令 ID。完成判定 = 标题未保存标记消失；标题本来干净时触发后' +
+        'WM_COMMAND 到"文件 > 保存"菜单项（免前台，IDE 在后台也能保存）。按已知命令 ID ' +
+        '定位保存项，回退结构签名。完成判定 = 标题未保存标记消失；标题本来干净时触发后' +
         '短等确认窗口存活即返回。超时多半是 IDE 弹了保存冲突三选框/错误框等人工确认。' +
-        '退出码：2 = 没定位到保存菜单项；3 = 已触发但超时/PostMessage 失败。',
+        '退出码：2 = 没定位到保存菜单项；3 = 已触发但超时/PostMessage 失败；' +
+        '5 = IDE 已有模态对话框（先处理再重试，避免叠框）。',
       inputSchema: commonSchema,
     },
     async ({ instance, timeout_ms }) => toolResult(await saveProject(instance, timeout_ms ?? 60000)),
