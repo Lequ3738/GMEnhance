@@ -25,7 +25,7 @@
 // 两项，位置 0=运行、1=调试运行。顶层菜单栏项是普通 STRING 项，文本可读。
 //
 // 两种用法：
-//   node server.mjs status|sync|run|debug|stop [--instance 序号|标题] [--timeout 毫秒]
+//   node server.mjs status|sync|run|debug|stop|save [--instance 序号|标题] [--timeout 毫秒]
 //   node server.mjs                                      MCP stdio 模式（默认）
 //
 // MCP 模式下 stdout 是协议通道，任何诊断输出只允许走 stderr。
@@ -1275,6 +1275,118 @@ export async function runGame(kind, timeoutMs = 30000, instance) {
   };
 }
 
+// ---------- save_project：触发 IDE"保存工程" ----------
+
+// 在全部顶层子菜单里定位"文件 > 保存"的命令 ID。菜单项自绘无文本，不能按
+// 名字找；按结构签名找——高级模式文件菜单 = [新建, 打开, POPUP(历史记录),
+// SEP, 保存, SEP, ...]，取第一个含 POPUP 的顶层里 POPUP 之后的第一个非 SEP
+// 项。汉化版两套 TMainMenu（高级/简单）共用一个菜单栏，未激活的一套
+// （精简菜单）无 POPUP，签名天然排它。找不到时回退 id 0x10（高级模式保存，
+// 2026-10-04 运行时实测：触发后 GMSave 日志出现保存记录）。
+export function pickSaveCommandId(hwnd) {
+  const hmenu = GetMenu(hwnd);
+  if (!hmenu) return null;
+  const topCount = GetMenuItemCount(hmenu);
+  for (let i = 0; i < topCount; i++) {
+    const hsub = GetSubMenu(hmenu, i);
+    if (!hsub) continue;
+    const count = GetMenuItemCount(hsub);
+    let afterPopup = -1;
+    let sawPopup = false;
+    for (let j = 0; j < count; j++) {
+      const id = GetMenuItemID(hsub, j) >>> 0;
+      const st = GetMenuState(hsub, j, 0x400);
+      if (st & 0x800) continue; // separator
+      if (st & 0x10) { sawPopup = true; afterPopup = -1; continue; }
+      if (sawPopup && afterPopup < 0) afterPopup = id;
+    }
+    if (sawPopup && afterPopup > 0 && afterPopup !== 0xffffffff) return afterPopup;
+  }
+  // 回退：已知的保存命令 ID（高级模式文件菜单 leaf#4）
+  for (let i = 0; i < topCount; i++) {
+    const hsub = GetSubMenu(hmenu, i);
+    if (!hsub) continue;
+    const count = GetMenuItemCount(hsub);
+    for (let j = 0; j < count; j++) {
+      if ((GetMenuItemID(hsub, j) >>> 0) === 0x10) return 0x10;
+    }
+  }
+  return null;
+}
+
+// GM8 标题的未保存标记："Name* - Game Maker"（GMSave 保存成功后会把它移除，
+// 见 ide_hooks 标题修正）。星号位置随版本贴着名字或带空格，按"前段含 *"判。
+function titleDirtyFlag(title) {
+  const head = title.split(' - Game Maker')[0];
+  return head.includes('*');
+}
+
+// 触发 IDE 的"保存工程"（等同 Ctrl+S / 文件 > 保存）：WM_COMMAND 直投保存
+// 菜单项（Save1Click 无 dirty 检查，干净状态触发也会完整走一遍保存流程）。
+// 完成信号 = 标题未保存标记消失（保存成功由 IDE/GMSave 移除）；本来干净时
+// 触发后星号无变化，短等一轮确认窗口还活着即返回。超时多半是 IDE 弹了
+// 保存冲突三选框/错误框等人工确认（Debug 版可查 %TEMP%\GMSave.log）。
+export async function saveProject(instance, timeoutMs = 60000) {
+  const wins = findIdeWindows();
+  if (!wins.length) {
+    return { ok: false, code: 1, reason: '没找到任何 GameMaker 8.0 主窗口（TMainForm），IDE 未运行？' };
+  }
+  const r = resolveInstance(wins, instance);
+  if (r.error) {
+    return { ok: false, code: 4, reason: r.reason, instances: wins.map(briefInstance) };
+  }
+  const ide = r.target;
+
+  const id = pickSaveCommandId(ide.hwnd);
+  if (id == null) {
+    return { ok: false, code: 2, reason: '菜单结构里没定位到"文件 > 保存"（结构签名与回退 id 都未命中）' };
+  }
+
+  const title0 = windowTitle(ide.hwnd);
+  const dirty0 = titleDirtyFlag(title0);
+  const t0 = Date.now();
+  if (!PostMessageW(ide.hwnd, WM_COMMAND, id, null)) {
+    return { ok: false, code: 3, reason: 'PostMessage 失败' };
+  }
+
+  if (!dirty0) {
+    // 干净状态：保存流程照跑（重写 index/settings 等），但标题不动。
+    // 给一个短等待窗口确认 IDE 没当场退出/弹框即可。
+    await sleep(2000);
+    if (!IsWindow(ide.hwnd)) {
+      return { ok: false, code: 1, reason: '触发后 IDE 主窗口消失了' };
+    }
+    return {
+      ok: true, code: 0, dirty_before: false, saved_flag: false,
+      item_id: id, elapsed_ms: Date.now() - t0,
+      note: '标题无未保存标记（可能本来就没有修改）；已触发完整保存流程',
+      instance: briefInstance(ide, wins.indexOf(ide)),
+    };
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await sleep(300);
+    if (!IsWindow(ide.hwnd)) {
+      return { ok: false, code: 1, reason: '保存过程中 IDE 主窗口消失了' };
+    }
+    if (!titleDirtyFlag(windowTitle(ide.hwnd))) {
+      return {
+        ok: true, code: 0, dirty_before: true, saved_flag: true,
+        item_id: id, elapsed_ms: Date.now() - t0,
+        instance: briefInstance(ide, wins.indexOf(ide)),
+      };
+    }
+  }
+  return {
+    ok: false, code: 3,
+    reason: `已触发保存（id 0x${id.toString(16)}），但 ${timeoutMs}ms 内标题未保存标记未消失；` +
+      '大概率 IDE 弹了保存冲突三选框/错误框等人工确认，或保存超过超时（大工程全量可加大 timeout_ms）',
+    dirty_before: true, item_id: id,
+    instance: briefInstance(ide, wins.indexOf(ide)),
+  };
+}
+
 // ---------- CLI ----------
 
 function parseArgs(args) {
@@ -1329,6 +1441,11 @@ async function cliMain(argv) {
     if (s.timeout) return 6;
     if (s.status === 1 || s.status === 2) return 0;
     return s.status === 4 ? 5 : 6;
+  }
+  if (cmd === 'save') {
+    const r = await saveProject(opts.instance, opts.timeout ?? 60000);
+    console.log(JSON.stringify(r, null, 2));
+    return r.ok ? 0 : (r.code ?? 3);
   }
   if (cmd === 'stop') {
     const r = await stopGames({ pid: opts.pid ?? null, instance: opts.instance, graceMs: opts.grace ?? 3000 });
@@ -1400,7 +1517,7 @@ async function cliMain(argv) {
     await mcpSelftest();
     return 0;
   }
-  console.error('用法: node server.mjs status|project|sync|run|debug|stop|open <工程路径>|close|action <编号|名称>|actions-md [--instance 序号|标题] [--timeout 毫秒] [--pid 进程号] [--grace 毫秒] | mcp-selftest\n' +
+  console.error('用法: node server.mjs status|project|sync|run|debug|stop|save|open <工程路径>|close|action <编号|名称>|actions-md [--instance 序号|标题] [--timeout 毫秒] [--pid 进程号] [--grace 毫秒] | mcp-selftest\n' +
     '  sync 退出码: 0 已同步/无需同步; 5 需人工处理; 6 顺延/超时; 7 通道不可用\n' +
     '  stop 退出码: 0 已停止/无游戏; 5 有进程未能停止; 7 pid 不是正在运行的游戏\n' +
     '  open 退出码: 0 已启动并载入; 1 启动失败/exe 找不到; 6 超时; 7 路径参数无效\n' +
@@ -1439,7 +1556,7 @@ async function mcpMain() {
   const { StdioServerTransport } = await import('@modelcontextprotocol/sdk/server/stdio.js');
   const { z } = await import('zod');
 
-  const server = new McpServer({ name: 'gm8', version: '0.7.0' });
+  const server = new McpServer({ name: 'gm8', version: '0.8.0' });
   const commonSchema = {
     instance: z
       .union([z.number().int().min(1), z.string().min(1)])
@@ -1721,6 +1838,21 @@ async function mcpMain() {
       inputSchema: commonSchema,
     },
     async ({ instance, timeout_ms }) => toolResult(await runGame('debug', timeout_ms ?? 30000, instance)),
+  );
+
+  server.registerTool(
+    'save_project',
+    {
+      title: '保存 GM8 工程',
+      description:
+        '触发某个 GameMaker 8.0 IDE 实例的"保存工程"（等同 Ctrl+S）：给 IDE 主窗口投递 ' +
+        'WM_COMMAND 到"文件 > 保存"菜单项（免前台，IDE 在后台也能保存）。按结构签名定位' +
+        '保存项，回退已知命令 ID。完成判定 = 标题未保存标记消失；标题本来干净时触发后' +
+        '短等确认窗口存活即返回。超时多半是 IDE 弹了保存冲突三选框/错误框等人工确认。' +
+        '退出码：2 = 没定位到保存菜单项；3 = 已触发但超时/PostMessage 失败。',
+      inputSchema: commonSchema,
+    },
+    async ({ instance, timeout_ms }) => toolResult(await saveProject(instance, timeout_ms ?? 60000)),
   );
 
   await server.connect(new StdioServerTransport());
