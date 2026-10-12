@@ -5,7 +5,8 @@
 
 ## 架构：纯外部方案（零注入、零新增可执行文件）
 
-`server.mjs` 一个文件，Node 进程内用 koffi FFI 完成全部 Win32 调用：
+`server.mjs` 与纯文件的 `gmspr_codec.mjs`（gmspr ↔ gm80 精灵文件夹互转编解码，
+不碰 Win32），Node 进程内用 koffi FFI 完成全部 Win32 调用：
 
 1. `FindWindowExW` 枚举全部 `TMainForm` 主窗体（**支持多开 IDE**），取各实例的 pid 与标题；
 2. 枚举 Win32 菜单，按顶层 Caption（`运行(&U)` / `Run`）定位"运行"子菜单，取其叶子项
@@ -32,8 +33,12 @@ GM8 编译用的是 **IDE 内存里**的工程：外部工具改了磁盘上的 
   reqId、status、detail），本进程轮询读取；reqId 最后写，作为完成标记；
 - 通道实现见 GMSave 仓库 `GMSave/project_watcher.cpp` 的 ForceSync 段。
 
-状态码：`1` 已重载、`2` 无需重载、`3` 顺延（重试）、`4` 需人工处理（未弹窗、未运行）、
-`5` 没有受监视的 .gm80 工程。映射打不开 = 部署的 GMSave.dll 旧于 ForceSync 版本。
+状态码：`1` 已重载、`2` 无需重载（磁盘与 base 快照真一致，可靠语义，可直接当"已同步"）、
+`3` 顺延（可稍后重试）、`4` 需人工处理（未弹窗、未运行）、`5` 没有受监视的 .gm80 工程、
+`6` 合并流已运行但未重载（磁盘改动可能未生效；非顺延，勿盲目重试——detail `1` = 合并基线
+缺失，GMSave 已就地重建基线并跳过本轮，重做一次外部改动再 sync 即可；detail `0` = 其余流程
+失败，原因见 GMSave 日志 `%TEMP%\GMSave.log`。`sync` CLI 退出码 8 对应此态）。
+映射打不开 = 部署的 GMSave.dll 旧于 ForceSync 版本。
 
 ### 多实例
 
@@ -76,7 +81,7 @@ npm install
 }
 ```
 
-重启会话后可用工具：`mcp__gm8__status`、`mcp__gm8__sync_project`、`mcp__gm8__run_game`、`mcp__gm8__run_debug`。
+重启会话后可用工具：`mcp__gm8__status`、`mcp__gm8__sync_project`、`mcp__gm8__run_game`、`mcp__gm8__run_debug`、`mcp__gm8__gmspr_unpack`、`mcp__gm8__gmspr_pack`。
 
 ## 工具
 
@@ -87,10 +92,13 @@ npm install
 | `open_project` | `path`, `timeout_ms?` | 启动**新** IDE 进程打开工程（等同双击关联文件）：安装路径先读注册表 `HKCU\Software\Game Maker\Version 8\Preferences\Directory`，兜底扫描 Program Files (x86)；等新实例出现并确认载入完成 |
 | `close_ide` | `instance?`, `timeout_ms?`, `stop_games?` | 请求 IDE 退出（WM_CLOSE = 点 X）：关闭前读 GM 脏标志预检 `unsaved_changes`；有未保存修改时 GM 弹自己的保存确认框等人工处理（预期行为），超时未退出即报退出码 6 |
 | `sync_project` | `instance?`, `timeout_ms?` | 让 GMSave 立即检查磁盘改动并重载进 IDE 内存；run_* 已内置前置同步，单独确认同步结果时才需要调 |
-| `run_game` | `instance?`, `timeout_ms?` | 前置同步后触发"正常运行"（F5）；返回新游戏进程 PID |
-| `run_debug` | `instance?`, `timeout_ms?` | 前置同步后触发"调试运行"（F6） |
+| `run_game` | `instance?`, `timeout_ms?`, `prefile?` | 前置同步后触发"正常运行"（F5）；返回新游戏进程 PID。`prefile` = `{file, content}`，确认触发后在游戏工作目录下落盘该相对路径文件（启动前写标记/约定文件的通用机制） |
+| `run_debug` | `instance?`, `timeout_ms?`, `prefile?` | 前置同步后触发"调试运行"（F6）；`prefile` 语义同 `run_game` |
 | `stop_game` | `instance?` / `pid?`, `grace_ms?` | 关闭该 IDE 启动的全部游戏（或 pid 指定的一个）：先 WM_CLOSE 优雅退出（宽限期内每 150ms 补发，兼容刚启动还没出现窗口的游戏），超时才 TerminateProcess；没有游戏时是成功无操作（幂等） |
+| `read_dialog` | `instance?`, `class_name?` | 读取该 IDE 及其游戏进程下的全部可见弹窗并枚举子控件（类名/文本/矩形/可见性），只读不点。默认三类：`TErrorForm`（IDE 错误框，正文可全文抓取）、`TMessageForm`（Delphi 消息框：游戏运行时错误/资源错误——正文画在窗体 Canvas 上不落子控件，只能拿标题+按钮，正文配截图）、`#32770`（Windows 标准对话框）。用于无人值守排查 `run_*` 失败原因；没有弹窗时正常返回 `count:0` |
 | `action_info` | `query?`, `list?` | 查询 D&D 动作定义（数据源 = GM8 安装目录 `lib\*.lib`，262 条模板，已与 IDE 内存逐字段对照验证）：编号（"603"）查含义、名称/英文标签子串搜索（"执行代码"/"action_create_object"）、不传参数列全表。返回中文名、参数表（类型/标题/默认值）与可直接粘贴进对象 .gml 的 YYD ACTION 模板块。配套 `node server.mjs actions-md` 可重新生成全量速查文档 [ACTIONS.md](ACTIONS.md) |
+| `gmspr_unpack` | `file`, `out_dir?`, `overwrite?` | gmspr 精灵文件解包为 .gm80 工程同构的精灵文件夹（`0.png…+sprite.txt`，帧十进制编号不补零）：可直接拷进工程 `sprites/` 再登记 index.yyd/tree.yyd + sync_project；像素忠实导出，不做空白裁剪/颜色膨胀；返回尺寸/帧数/原点/碰撞/包围盒摘要 |
+| `gmspr_pack` | `dir`, `out_file?`, `overwrite?` | 精灵文件夹打包回 gmspr（运行时 `sprite_add_sprite`/`pic_load` 可加载，如外部内容包）：帧按 N.png 数字序（字典序会排错 10 与 2）；校验 frames 键与帧数一致、全帧同尺寸；缺 sprite.txt/字段非法报错不猜测 |
 
 ### 工程格式：.gm80 与 .gmk
 
@@ -103,6 +111,25 @@ GM8 有两类工程，`get_project` / `status` 返回的 `format` 字段区分�
   没有可编辑的文本文件，GMSave 的外部改动监视/重载也不适用。`sync_project`
   对它直接返回"不适用"（`applicable: false`，不打扰 GMSave），`run_*` 照常运行
   并在警告里说明。要改 `.gmk` 工程只能先在 IDE 里另存为 `.gm80`。
+
+### 精灵格式：.gmspr 与精灵文件夹
+
+`.gmspr` 是 GM8 运行时精灵文件（魔数 1234321，zlib 负载内为版本 800 头 + BGRA 裸像素帧 +
+碰撞/包围盒属性），`sprite_add_sprite` / `pic_load` 加载它；`.gm80` 工程磁盘侧的精灵则是
+`<名>/0.png、1.png… + sprite.txt` 文件夹（GMSave 写读，键序与值域见 gm80_save.cpp）。
+`gmspr_unpack` / `gmspr_pack` 在两者间无损互转，导入、导出、回环编辑三条工作流一副工具：
+解包结果拷进 `sprites/` 即为工程精灵素材，工程精灵文件夹可直接打包成外部内容包。
+
+实现要点（读端权威 = GMGraphic `load_resources.cpp` decode_gmspr）：
+
+- **双向换序**：gmspr 帧是 D3D 字节序 BGRA，PNG 是 RGBA，编解码各换一次；
+- **包围盒字段序**：gmspr 二进制是 left/right/bottom/top，sprite.txt 文本是
+  left/top/right/bottom，互转需重排；
+- **帧序按数字序**：帧文件 `%u.png` 十进制不补零，按字典序会排错 `10.png` 与 `2.png`；
+- **忠实转换**：不掺空白裁剪/颜色膨胀（图集打包的运行时加工），往返负载逐字节一致
+  （`test_gmspr_codec.mjs` 用 GMAPI/Sprites 真实文件验证）；
+- **防御**：frames 键与帧文件数不一致、全帧尺寸不一、缺 sprite.txt、坏魔数均报错不猜测；
+  默认不覆盖已存在目标（`overwrite` 显式放开）。
 
 ## 语义与边界
 
@@ -121,6 +148,7 @@ GM8 有两类工程，`get_project` / `status` 返回的 `format` 字段区分�
   可同时存在多个游戏实例（与手动连按 F5 的行为一致）。
 - **编译错误**：IDE 自己弹 GBK 错误框，工具表现为超时（退出码 3），需人工查看 IDE。
 - **无房间工程**：IDE 运行管线会弹"至少要有一个房间才能运行"，同样表现为超时。
+- **启动前写文件（prefile）**：`run_*` 的 `prefile` = `{file, content}`，在**确认要触发运行之后**把 content 写入游戏工作目录下的相对路径 file（自动建父目录；禁绝对路径与 .. 逃逸）。触发失败（PostMessage 失败）回收该文件，避免陈旧文件影响下一次（包括人工触发的）启动；触发成功则留在原地——读不读、何时删是调用方与游戏的约定（编译超时后游戏排队启动也能吃到）。落盘失败 = 退出码 8，宁可不跑也不让启动偏离预期。服务器不解释文件名与内容；GM8 按 ANSI(GBK) 读文本文件，内容请用 ASCII。
 - **窗口类事实**：GM8 游戏主窗口的窗口类**不是** `TMainForm`（与 IDE 不同，实测游戏
   运行时不会污染实例枚举）；停止游戏按 pid + 可见性找窗口即可，不依赖类名。
 
@@ -130,12 +158,14 @@ GM8 有两类工程，`get_project` / `status` 返回的 `format` 字段区分�
 node server.mjs status
 node server.mjs project [--instance 序号|标题子串]
 node server.mjs sync [--instance 序号|标题子串] [--timeout 毫秒]
-node server.mjs run [--instance 序号|标题子串] [--timeout 毫秒]
-node server.mjs debug [--instance 序号|标题子串] [--timeout 毫秒]
+node server.mjs run [--instance 序号|标题子串] [--timeout 毫秒] [--prefile 相对路径=内容]
+node server.mjs debug [--instance 序号|标题子串] [--timeout 毫秒] [--prefile 相对路径=内容]
 node server.mjs stop [--instance 序号|标题子串] [--pid 进程号] [--grace 毫秒]
 node server.mjs open <工程路径> [--timeout 毫秒]
 node server.mjs close [--instance 序号|标题子串] [--timeout 毫秒]
 node server.mjs action <编号|名称子串>       # 查 D&D 动作定义与 YYD ACTION 模板
+node server.mjs gmspr-unpack <文件.gmspr> [--out 目录] [--overwrite]
+node server.mjs gmspr-pack <精灵文件夹> [--out 文件.gmspr] [--overwrite]
 node server.mjs action --list               # 全部动作索引
 node server.mjs actions-md                  # 重新生成 ACTIONS.md 速查文档
 node server.mjs mcp-selftest        # 校验 MCP SDK 依赖
@@ -145,7 +175,8 @@ node server.mjs mcp-selftest        # 校验 MCP SDK 依赖
 `3` 已触发但没等到游戏进程；`4` 多实例歧义（需指定 instance）；`5` 同步被拒需人工（run）/
 有进程未能停止（stop）；`6` 同步顺延/超时（未运行）/ IDE 未退出或工程未载入完成（close/open，
 多半弹了对话框等人工）；`7`（sync）同步通道不可用 /（stop）pid 不是正在运行的游戏 /
-（open）路径参数无效。
+（open）路径参数无效 / `8`（run/debug）prefile 落盘失败（未运行）/（sync）合并流失败
+（非顺延，勿盲目重试）。
 
 ## 测试流程
 
@@ -164,6 +195,9 @@ node server.mjs mcp-selftest        # 校验 MCP SDK 依赖
 9. （可选）`open <某 .gmk>` → 新 IDE 弹出并载入，`project` 报 `format: "native"`，
    `sync` 返回 `gmk-unsupported`（applicable: false，不弹窗不报错），`run` 正常运行且带
    gmk 警告；`close --instance <该实例>` → 干净退出（`unsaved_changes: false`，无弹窗）。
+10. （可选）基线缺失：把工程 `cache/gmsave-base/manifest.json` 改名，改一笔工程文件再
+    `sync` → 应返回 `failed` + detail 1（退出码 8，全程无弹窗不超时），且 `cache/` 下
+    重建出新的 `gmsave-base/`；再改一笔后 `sync` → 应回 `reloaded`。
 
 ## 维护备注
 

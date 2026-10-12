@@ -25,7 +25,7 @@
 // 两项，位置 0=运行、1=调试运行。顶层菜单栏项是普通 STRING 项，文本可读。
 //
 // 两种用法：
-//   node server.mjs status|sync|run|debug|stop|save [--instance 序号|标题] [--timeout 毫秒]
+//   node server.mjs status|sync|run|debug|stop|save [--instance 序号|标题] [--timeout 毫秒] [--prefile 相对路径=内容]
 //   node server.mjs                                      MCP stdio 模式（默认）
 //
 // MCP 模式下 stdout 是协议通道，任何诊断输出只允许走 stderr。
@@ -36,6 +36,7 @@ import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import path from 'node:path';
 import koffi from 'koffi';
+import { unpackGmsprFile, packGmsprDir } from './gmspr_codec.mjs';
 
 // ---------- Win32 绑定（user32 / kernel32） ----------
 
@@ -63,6 +64,8 @@ const GetMenuStringW = user32.func('__stdcall', 'GetMenuStringW', 'int', ['void 
 const PostMessageW = user32.func('__stdcall', 'PostMessageW', 'int', ['void *', 'uint32', 'uint32', 'void *']);
 const RegisterWindowMessageW = user32.func('__stdcall', 'RegisterWindowMessageW', 'uint32', ['str16']);
 const IsWindowVisible = user32.func('__stdcall', 'IsWindowVisible', 'int', ['void *']);
+const GetClassNameW = user32.func('__stdcall', 'GetClassNameW', 'int', ['void *', koffi.out(koffi.pointer('uint16')), 'int']);
+const GetWindowRect = user32.func('__stdcall', 'GetWindowRect', 'int', ['void *', koffi.out(koffi.pointer('int32', 4))]);
 
 const OpenFileMappingW = kernel32.func('__stdcall', 'OpenFileMappingW', 'void *', ['uint32', 'int', 'str16']);
 const MapViewOfFile = kernel32.func('__stdcall', 'MapViewOfFile', 'void *', ['void *', 'uint32', 'uint32', 'uint32', 'uintptr']);
@@ -168,6 +171,19 @@ function windowTitle(hwnd) {
   const buf = Buffer.alloc(512);
   const n = GetWindowTextW(hwnd, buf, 256);
   return n > 0 ? buf.toString('utf16le', 0, n * 2) : '';
+}
+
+function windowClassName(hwnd) {
+  const buf = Buffer.alloc(512);
+  const n = GetClassNameW(hwnd, buf, 256);
+  return n > 0 ? buf.toString('utf16le', 0, n * 2) : '';
+}
+
+/** [left, top, right, bottom]；失败返回 null */
+function windowRect(hwnd) {
+  const r = Buffer.alloc(16);
+  if (!GetWindowRect(hwnd, r)) return null;
+  return [r.readInt32LE(0), r.readInt32LE(4), r.readInt32LE(8), r.readInt32LE(12)];
 }
 
 function windowPid(hwnd) {
@@ -285,6 +301,64 @@ export function gamesRunning() {
 // ---------- 核心：实例消歧 ----------
 
 /**
+ * 读取指定 IDE 实例（及其启动的游戏进程）下的指定类名顶层可见弹窗，并枚举其全部
+ * 子控件（类名/文本/矩形/可见性）。默认覆盖三类弹窗：TErrorForm = IDE 侧错误框
+ * （正文在子控件文本里，可全文抓取）；TMessageForm = Delphi 消息框（游戏运行时错误、
+ * 资源错误等，正文画在窗体 Canvas 上不落子控件——只能抓到标题与按钮，正文需配截图）；
+ * #32770 = Windows 标准对话框（保存冲突三选框等）。只读，不点任何按钮。
+ */
+const DEFAULT_DIALOG_CLASSES = 'TErrorForm,TMessageForm,#32770';
+
+export function readDialogs(instance, className) {
+  const classes = String(className || DEFAULT_DIALOG_CLASSES)
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const wins = findIdeWindows();
+  if (!wins.length) {
+    return { ok: false, code: 1, reason: '没找到任何 GameMaker 8.0 主窗口（TMainForm），IDE 未运行？' };
+  }
+  const r = resolveInstance(wins, instance);
+  if (r.error) {
+    return { ok: false, code: 4, reason: r.reason, instances: wins.map(briefInstance) };
+  }
+  const ide = r.target;
+  const idx = wins.indexOf(ide);
+  const pids = new Set([ide.pid, ...gamesRunning().filter((g) => g.ppid === ide.pid).map((g) => g.pid)]);
+  const forms = [];
+  const seen = new Set();
+  for (const cls of classes) {
+    for (let h = FindWindowExW(null, null, cls, null); h; h = FindWindowExW(null, h, cls, null)) {
+      const key = String(koffi.address(h));
+      const pid = windowPid(h);
+      if (seen.has(key) || !pids.has(pid) || !IsWindowVisible(h)) continue;
+      seen.add(key);
+      const controls = [];
+      for (let c = FindWindowExW(h, null, null, null); c; c = FindWindowExW(h, c, null, null)) {
+        controls.push({
+          class: windowClassName(c),
+          text: windowTitle(c),
+          rect: windowRect(c),
+          visible: !!IsWindowVisible(c),
+        });
+      }
+      forms.push({
+        pid,
+        hwnd: key,
+        class: cls,
+        title: windowTitle(h),
+        rect: windowRect(h),
+        controls,
+      });
+    }
+  }
+  const headline = forms.length
+    ? `找到 ${forms.length} 个弹窗（IDE #${idx + 1} pid ${ide.pid}）`
+    : `未发现弹窗（IDE #${idx + 1} pid ${ide.pid}）`;
+  return { ok: true, headline, instance: briefInstance(ide, idx), class_name: classes.join(','), count: forms.length, forms };
+}
+
+/**
  * 把 instance 选择器（1 基序号，或标题子串，大小写不敏感）解析到实例。
  * 单实例时无条件命中；多实例未指定或歧义时返回 error，附带实例清单。
  */
@@ -315,11 +389,12 @@ const briefInstance = (x, i) => ({ index: i + 1, pid: x.pid, title: x.title });
 // 状态码与 GMSave project_watcher.cpp 的 force_sync_report 一一对应
 const SYNC_STATUS = {
   1: 'reloaded', // 合并流已跑完，工程已从磁盘重载
-  2: 'nothing-to-do', // 磁盘与 base 快照一致，无需重载
+  2: 'nothing-to-do', // 磁盘与 base 快照一致，无需重载（可靠语义，可直接当"已同步"）
   3: 'deferred', // 顺延重试（见 detail）
   4: 'needs-manual', // 拒绝执行：需要人工在 IDE 里处理，未弹任何窗
   5: 'not-watching', // 没有受监视的 .gm80 工程（未打开或工程已切换）
-  6: 'failed', // 保留
+  6: 'failed', // 合并流已运行但未重载：磁盘改动可能未生效——既不是"已同步"
+  //   也不是可稍后重试的顺延，勿盲目重试，先排查再重试（见 detail 与 GMSave 日志）
 };
 const SYNC_DETAIL = {
   '3:1': 'GMSave 合并流程正在运行',
@@ -327,6 +402,12 @@ const SYNC_DETAIL = {
   '3:3': '独立的代码编辑窗口开着（重载会损坏它）',
   '3:4': '有资源编辑窗处于模态状态',
   '4:2': 'IDE 存在未保存的修改（标题栏 * ）——合并流的确认弹窗需要人回答',
+  // GM8 Delphi MM 池锁卡死（GMSave mm_audit）：重载会卡进 GM 自己的 CAS 自旋，
+  // 永久未响应——GMSave 主动拒绝。恢复：重启 IDE；或外部解锁后重试
+  // （GMEnhance/mcp/poolpoison.mjs unlockall <pid>，现场记录 %TEMP%\GMSave_MMBroken.txt）
+  '4:3': 'IDE 内存管理器卡死（内部堆锁未释放）——重载会永久未响应，已拒绝；请重启 IDE',
+  '6:1': '合并基线缺失：GMSave 已就地重建基线并跳过本轮，本次外部改动未应用——' +
+    '把改动重做（或再改一笔）后再 sync 即可正常合并',
 };
 
 /** 该 IDE 进程的 GMSave.Watcher 隐藏窗口（无则未部署/未载入 GMSave） */
@@ -526,6 +607,24 @@ function projectInfo(pid) {
     format: projectFormat(p.path),
     folder: projectFolder(p.path),
   };
+}
+
+// 游戏 from IDE 运行时的工作目录 = IDE 眼里工程路径的父目录：.gmk 系是文件
+// 所在目录；.gm80 的工程路径指到受监视文件夹，再上一层才是运行目录
+// （游戏按相对路径寻址的资源都在这一层）。
+export function gameWorkingDir(projPath, format) {
+  const base = format === 'gm80' ? projectFolder(projPath) : projPath;
+  return base ? path.dirname(base) : null;
+}
+
+// 把内容写到游戏工作目录下的相对路径（自动建父目录），返回落点绝对路径。
+// relPath 用 / 或 \ 均可；服务器不解释文件名与内容——那些是调用方与游戏的约定。
+export function writeGameFile(projPath, format, relPath, content) {
+  const rel = relPath.replace(/\\/g, '/');
+  const target = path.join(gameWorkingDir(projPath, format), ...rel.split('/'));
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, content, 'utf8');
+  return target;
 }
 
 // ---------- 核心：停止游戏 ----------
@@ -1144,7 +1243,7 @@ export function status() {
 // 退出码：0 成功；1 IDE 窗口不存在；2 菜单项缺失/置灰；3 已触发但没等到游戏进程；
 // 4 多实例歧义（需指定 instance）；5 同步被拒——IDE 有未应用的修改/冲突需人工处理，
 // 未触发运行；6 同步顺延/失败/超时——工程状态未确认，未触发运行
-export async function runGame(kind, timeoutMs = 30000, instance) {
+export async function runGame(kind, timeoutMs = 30000, instance, prefile) {
   const wins = findIdeWindows();
   if (!wins.length) {
     return { ok: false, code: 1, reason: '没找到任何 GameMaker 8.0 主窗口（TMainForm），IDE 未运行？' };
@@ -1201,6 +1300,19 @@ export async function runGame(kind, timeoutMs = 30000, instance) {
       sync,
       instance: briefInstance(ide, wins.indexOf(ide)),
     };
+  } else if (sync.status === 6) {
+    // 合并流跑了但没重载：磁盘改动可能未生效，编出来的就是幽灵二进制。
+    // 与 3 不同，这不是"稍后重试"能解决的——先把失败报给上层。
+    return {
+      ok: false,
+      code: 9,
+      reason: '同步失败：合并流已运行但工程未重载' +
+        (sync.detail_text ? `（${sync.detail_text}）` : '（原因见 GMSave 日志 %TEMP%\\GMSave.log）') +
+        '。为避免跑旧代码，本次未触发运行；这不是顺延，勿盲目重试——' +
+        '先按 detail 排查（基线缺失则重做外部改动再试），修复后再 run',
+      sync,
+      instance: briefInstance(ide, wins.indexOf(ide)),
+    };
   } else if (sync.status === 5) {
     warn.push('GMSave 报告没有受监视的 .gm80 工程（未打开或已切换）：' +
       '游戏将按 IDE 内存现状运行，磁盘改动不会生效');
@@ -1236,10 +1348,32 @@ export async function runGame(kind, timeoutMs = 30000, instance) {
     return { ok: false, code: 2, reason: `菜单项(位置 ${item.index}, id ${item.id})当前置灰，多半没打开工程`, item };
   }
 
+  // prefile 必须在确认要触发运行之后才落盘：提前写而运行没跑起来，会留下
+  // 陈旧文件影响下一次（包括人工触发的）启动。PostMessage 失败路径回收该文件；
+  // 触发成功后留在原地——读不读、何时删是调用方与游戏的约定，即便编译超时后
+  // 游戏才排队启动也能吃到。
+  let prefileFile = null;
+  if (prefile !== undefined) {
+    const rel = String(prefile.file ?? '').trim().replace(/\\/g, '/');
+    if (!rel || path.isAbsolute(rel) || rel.split('/').includes('..')) {
+      return { ok: false, code: 8, reason: 'prefile.file 必须是游戏工作目录下的相对路径（不允许绝对路径与 .. 逃逸），未运行' };
+    }
+    const proj = projectInfo(ide.pid);
+    if (proj.format !== 'gm80' && proj.format !== 'native') {
+      return { ok: false, code: 8, reason: 'prefile：确定不了 IDE 当前工程路径（没打开工程？），无法定位游戏工作目录，未运行' };
+    }
+    try {
+      prefileFile = writeGameFile(proj.path, proj.format, rel, String(prefile.content ?? ''));
+    } catch (e) {
+      return { ok: false, code: 8, reason: `prefile 写入失败：${e?.message ?? e}，未运行` };
+    }
+  }
+
   // 触发前记录该 IDE 自己的游戏进程，之后新出现的才算本次启动；
   // ppid 归因保证另一个 IDE（或其游戏）的变化不会被误判。
   const before = new Set(gamesRunning().filter((g) => g.ppid === ide.pid).map((g) => g.pid));
   if (!PostMessageW(ide.hwnd, WM_COMMAND, item.id, null)) {
+    if (prefileFile) { try { fs.unlinkSync(prefileFile); } catch { /* 已不在=无事可做 */ } }
     return { ok: false, code: 3, reason: 'PostMessage 失败' };
   }
 
@@ -1255,6 +1389,7 @@ export async function runGame(kind, timeoutMs = 30000, instance) {
         path: fresh.path,
         mode: kind,
         item_id: item.id,
+        prefile: prefileFile ? { file: prefileFile } : undefined,
         sync: sync ? { status: sync.status, status_name: sync.status_name } : null,
         warnings: warn.length ? warn : undefined,
         instance: briefInstance(ide, wins.indexOf(ide)),
@@ -1424,6 +1559,14 @@ function parseArgs(args) {
     } else if (args[i] === '--grace' && args[i + 1]) {
       const v = Number(args[++i]);
       if (Number.isFinite(v) && v >= 0) out.grace = v;
+    } else if (args[i] === '--prefile' && args[i + 1]) {
+      const spec = args[++i];
+      const eq = spec.indexOf('=');
+      if (eq > 0) out.prefile = { file: spec.slice(0, eq), content: spec.slice(eq + 1) };
+    } else if (args[i] === '--out' && args[i + 1]) {
+      out.out = args[++i];
+    } else if (args[i] === '--overwrite') {
+      out.overwrite = true;
     }
   }
   return out;
@@ -1437,7 +1580,7 @@ async function cliMain(argv) {
     return 0;
   }
   if (cmd === 'run' || cmd === 'debug') {
-    const r = await runGame(cmd, opts.timeout ?? 30000, opts.instance);
+    const r = await runGame(cmd, opts.timeout ?? 30000, opts.instance, opts.prefile);
     console.log(JSON.stringify(r, null, 2));
     return r.code;
   }
@@ -1460,7 +1603,9 @@ async function cliMain(argv) {
     if (!s.supported) return 7;
     if (s.timeout) return 6;
     if (s.status === 1 || s.status === 2) return 0;
-    return s.status === 4 ? 5 : 6;
+    if (s.status === 4) return 5;
+    if (s.status === 6) return 8; // 合并流失败：非顺延，勿盲目重试
+    return 6;
   }
   if (cmd === 'save') {
     const r = await saveProject(opts.instance, opts.timeout ?? 60000);
@@ -1533,12 +1678,42 @@ async function cliMain(argv) {
     console.log(`已生成 ${writeActionsMarkdown(out)}`);
     return 0;
   }
+  if (cmd === 'gmspr-unpack') {
+    const file = argv[1] && !argv[1].startsWith('--') ? argv[1] : null;
+    if (!file) {
+      console.error('用法: node server.mjs gmspr-unpack <文件.gmspr> [--out 目录] [--overwrite]');
+      return 7;
+    }
+    try {
+      console.log(JSON.stringify(unpackGmsprFile(file, opts.out, { overwrite: !!opts.overwrite }), null, 2));
+      return 0;
+    } catch (e) {
+      console.error(e.message);
+      return 1;
+    }
+  }
+  if (cmd === 'gmspr-pack') {
+    const dir = argv[1] && !argv[1].startsWith('--') ? argv[1] : null;
+    if (!dir) {
+      console.error('用法: node server.mjs gmspr-pack <精灵文件夹> [--out 文件.gmspr] [--overwrite]');
+      return 7;
+    }
+    try {
+      console.log(JSON.stringify(packGmsprDir(dir, opts.out, { overwrite: !!opts.overwrite }), null, 2));
+      return 0;
+    } catch (e) {
+      console.error(e.message);
+      return 1;
+    }
+  }
   if (cmd === 'mcp-selftest') {
     await mcpSelftest();
     return 0;
   }
-  console.error('用法: node server.mjs status|project|sync|run|debug|stop|save|open <工程路径>|close|action <编号|名称>|actions-md [--instance 序号|标题] [--timeout 毫秒] [--pid 进程号] [--grace 毫秒] | mcp-selftest\n' +
-    '  sync 退出码: 0 已同步/无需同步; 5 需人工处理; 6 顺延/超时; 7 通道不可用\n' +
+  console.error('用法: node server.mjs status|project|sync|run|debug|stop|save|open <工程路径>|close|action <编号|名称>|actions-md|gmspr-unpack <文件.gmspr>|gmspr-pack <精灵文件夹> [--instance 序号|标题] [--timeout 毫秒] [--pid 进程号] [--grace 毫秒] [--prefile 相对路径=内容] [--out 路径] [--overwrite] | mcp-selftest\n' +
+    '  run/debug 的 --prefile: 启动前把内容写入游戏工作目录下的该相对路径文件（通用机制，语义归调用方）\n' +
+    '  gmspr-unpack/gmspr-pack 的 --out/--overwrite: 输出路径与覆盖已存在目标（默认输出到源旁边同名处）\n' +
+    '  sync 退出码: 0 已同步/无需同步; 5 需人工处理; 6 顺延/超时; 7 通道不可用; 8 合并流失败（非顺延，勿盲目重试）\n' +
     '  stop 退出码: 0 已停止/无游戏; 5 有进程未能停止; 7 pid 不是正在运行的游戏\n' +
     '  open 退出码: 0 已启动并载入; 1 启动失败/exe 找不到; 6 超时; 7 路径参数无效\n' +
     '  close 退出码: 0 已退出; 6 超时未退出（多半弹了保存确认框等人工）\n' +
@@ -1576,7 +1751,7 @@ async function mcpMain() {
   const { StdioServerTransport } = await import('@modelcontextprotocol/sdk/server/stdio.js');
   const { z } = await import('zod');
 
-  const server = new McpServer({ name: 'gm8', version: '0.8.1' });
+  const server = new McpServer({ name: 'gm8', version: '0.10.0' });
   const commonSchema = {
     instance: z
       .union([z.number().int().min(1), z.string().min(1)])
@@ -1590,6 +1765,20 @@ async function mcpMain() {
       .max(300000)
       .optional()
       .describe('等待上限，毫秒；默认 30000。中型工程编译约需 14 秒，更大工程可调大'),
+  };
+
+  // 仅 run_game/run_debug 使用：启动前落盘一个文件，语义由调用方与游戏约定
+  const runSchema = {
+    ...commonSchema,
+    prefile: z
+      .object({
+        file: z.string().min(1).describe('相对游戏工作目录的路径，/ 或 \\ 均可，禁绝对路径与 ..'),
+        content: z.string().describe('写入的全文；GM8 按 ANSI(GBK) 读文本文件，内容请用 ASCII'),
+      })
+      .optional()
+      .describe('启动前把 content 写入游戏工作目录下 file 的文件：确认触发后才落盘，' +
+        '触发失败（PostMessage 失败）回收，成功则留在原地（读不读、何时删由调用方与游戏约定）。' +
+        '通用机制，服务器不解释内容'),
   };
 
   server.registerTool(
@@ -1661,6 +1850,10 @@ async function mcpMain() {
           ? ['这是无人值守拒绝：需要在 IDE 里人工处理（保存/关闭编辑器/解决冲突）后重试']
           : []),
         ...(s.status === 3 ? ['可稍后重试；反复出现则需人工查看 IDE 窗口'] : []),
+        ...(s.status === 6
+          ? ['合并流运行了但工程未重载：磁盘改动可能未生效。这不是顺延，勿盲目重试；' +
+             '先按 detail 排查（基线缺失则重做外部改动再 sync），修复后再试']
+          : []),
         `目标 IDE：#${idx + 1} (pid ${ide.pid}) ${ide.title}`,
       ];
       return {
@@ -1842,10 +2035,12 @@ async function mcpMain() {
         'WM_COMMAND 触发编译运行（与用户点菜单同一条路径）。成功返回新游戏进程 PID，' +
         '编译耗时参考 timeout_ms 说明。多个 IDE 在跑时必须传 instance。' +
         '退出码：5 = IDE 有未应用的修改/冲突需人工处理（未运行）；6 = 同步顺延/超时（未运行）；' +
-        '3 = 已触发但超时，大概率 IDE 弹了编译错误对话框等人工确认。',
-      inputSchema: commonSchema,
+        '3 = 已触发但超时，大概率 IDE 弹了编译错误对话框等人工确认；' +
+        '8 = prefile 落盘失败（未运行）。',
+      inputSchema: runSchema,
     },
-    async ({ instance, timeout_ms }) => toolResult(await runGame('run', timeout_ms ?? 30000, instance)),
+    async ({ instance, timeout_ms, prefile }) =>
+      toolResult(await runGame('run', timeout_ms ?? 30000, instance, prefile)),
   );
 
   server.registerTool(
@@ -1854,10 +2049,11 @@ async function mcpMain() {
       title: '调试运行 GM8 游戏',
       description:
         '触发某个 GameMaker 8.0 IDE 实例的"调试运行"（等同按 F6），带调试器启动游戏。' +
-        '其余语义与 run_game 相同（含前置工程同步与退出码 5/6）。',
-      inputSchema: commonSchema,
+        '其余语义与 run_game 相同（含前置工程同步、prefile 参数与退出码 5/6）。',
+      inputSchema: runSchema,
     },
-    async ({ instance, timeout_ms }) => toolResult(await runGame('debug', timeout_ms ?? 30000, instance)),
+    async ({ instance, timeout_ms, prefile }) =>
+      toolResult(await runGame('debug', timeout_ms ?? 30000, instance, prefile)),
   );
 
   server.registerTool(
@@ -1874,6 +2070,110 @@ async function mcpMain() {
       inputSchema: commonSchema,
     },
     async ({ instance, timeout_ms }) => toolResult(await saveProject(instance, timeout_ms ?? 60000)),
+  );
+
+  server.registerTool(
+    'read_dialog',
+    {
+      title: '读取 GM8 弹窗文本',
+      description:
+        '读取指定 IDE 实例（及其启动的游戏进程）下的全部可见弹窗并抓取结构：' +
+        '默认覆盖 TErrorForm（IDE 错误框，正文可全文抓取）、TMessageForm（Delphi 消息框：' +
+        '游戏运行时错误/资源错误，正文画在窗体 Canvas 上抓不到子控件文本，只能拿标题+按钮，' +
+        '正文配截图工具）与 #32770（Windows 标准对话框，保存冲突三选框等）。' +
+        '返回每个弹窗的全部子控件（类名/文本/矩形/可见性）。只读，不点任何按钮；' +
+        '没有弹窗时正常返回 count:0。用于无人值守排查 run_* 失败原因、确认弹窗内容后' +
+        '再决定代答方式（按钮代答可用 external_click / modal_dismiss，' +
+        '保存冲突三选框见 save_project 退出码 5）。',
+      inputSchema: {
+        instance: commonSchema.instance,
+        class_name: z
+          .string()
+          .min(1)
+          .optional()
+          .describe('目标窗口类名，逗号分隔可传多个；默认 "TErrorForm,TMessageForm,#32770"'),
+      },
+    },
+    async ({ instance, class_name }) => toolResult(readDialogs(instance, class_name)),
+  );
+
+  server.registerTool(
+    'gmspr_unpack',
+    {
+      title: 'gmspr 解包为精灵文件夹',
+      description:
+        '把 GM8 精灵文件（.gmspr，sprite_add_sprite / pic_load 加载的运行时精灵格式）解包为 ' +
+        '.gm80 文本工程同构的精灵文件夹：<名>/0.png、1.png… + sprite.txt（GMSave 工程格式，' +
+        '帧从 0 起十进制编号不补零）。解包结果可直接拷进工程 sprites/ 目录作为精灵素材' +
+        '（新精灵还需按工程约定登记 index.yyd/tree.yyd，再 sync_project 同步进 IDE）。' +
+        '像素忠实导出（RGBA），不做空白裁剪/颜色膨胀（那是图集打包的运行时加工，不属于格式转换）。' +
+        '返回尺寸/帧数/原点/碰撞形状/包围盒摘要。纯文件操作，不需要 IDE 在跑。' +
+        '配对工具 gmspr_pack 可把文件夹打包回 gmspr。',
+      inputSchema: {
+        file: z.string().min(1).describe('gmspr 文件路径'),
+        out_dir: z
+          .string()
+          .optional()
+          .describe('输出文件夹；默认在源文件旁创建同名文件夹'),
+        overwrite: z
+          .boolean()
+          .optional()
+          .describe('目标文件夹已存在且非空时覆盖写入；默认 false（报错拒绝）'),
+      },
+    },
+    async ({ file, out_dir, overwrite }) => {
+      try {
+        const r = unpackGmsprFile(file, out_dir, { overwrite: overwrite ?? false });
+        return {
+          content: [{
+            type: 'text',
+            text: `OK：已解包 ${r.frames} 帧（${r.width}×${r.height}）到 ${r.dir}\n` +
+              '```json\n' + JSON.stringify(r, null, 2) + '\n```',
+          }],
+        };
+      } catch (e) {
+        return toolResult({ ok: false, code: 1, reason: e.message });
+      }
+    },
+  );
+
+  server.registerTool(
+    'gmspr_pack',
+    {
+      title: '精灵文件夹打包为 gmspr',
+      description:
+        '把 .gm80 工程格式的精灵文件夹（sprite.txt + 0.png、1.png…）打包为 GM8 精灵文件' +
+        '（.gmspr），供 sprite_add_sprite / pic_load 在运行时加载（如 GMAPI\\Sprites 这类' +
+        '外部内容包）。帧按 N.png 的数字序取（不补零编号，字典序会排错 10 与 2）；' +
+        '校验 frames 键与帧文件数一致、全帧同尺寸（GM8 精灵语义），sprite.txt 缺失或字段' +
+        '非法时报错而不猜测。帧编号不连续时按现存帧从 0 重排并在结果里警告。' +
+        '纯文件操作，不需要 IDE 在跑。配对工具 gmspr_unpack 可解包回文件夹。',
+      inputSchema: {
+        dir: z.string().min(1).describe('精灵文件夹（含 sprite.txt 与 N.png）'),
+        out_file: z
+          .string()
+          .optional()
+          .describe('输出 gmspr 路径；默认在文件夹旁产出 <文件夹名>.gmspr'),
+        overwrite: z
+          .boolean()
+          .optional()
+          .describe('目标文件已存在时覆盖；默认 false（报错拒绝）'),
+      },
+    },
+    async ({ dir, out_file, overwrite }) => {
+      try {
+        const r = packGmsprDir(dir, out_file, { overwrite: overwrite ?? false });
+        return {
+          content: [{
+            type: 'text',
+            text: `OK：已打包 ${r.frames} 帧（${r.width}×${r.height}）到 ${r.file}\n` +
+              '```json\n' + JSON.stringify(r, null, 2) + '\n```',
+          }],
+        };
+      } catch (e) {
+        return toolResult({ ok: false, code: 1, reason: e.message });
+      }
+    },
   );
 
   await server.connect(new StdioServerTransport());
