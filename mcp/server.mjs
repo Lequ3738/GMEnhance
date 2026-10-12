@@ -396,6 +396,15 @@ const SYNC_STATUS = {
   6: 'failed', // 合并流已运行但未重载：磁盘改动可能未生效——既不是"已同步"
   //   也不是可稍后重试的顺延，勿盲目重试，先排查再重试（见 detail 与 GMSave 日志）
 };
+// 状态码中文名（sync_project 等人读文本行用；status_name 保持英文协议名不变）
+const SYNC_STATUS_ZH = {
+  1: '已从磁盘重载',
+  2: '磁盘与快照一致，无需重载',
+  3: '顺延——当前不能重载，可稍后重试',
+  4: '需人工处理——已拒绝执行，未弹窗',
+  5: '没有受监视的 .gm80 工程',
+  6: '合并流失败，工程未重载——磁盘改动可能未生效，勿盲目重试',
+};
 const SYNC_DETAIL = {
   '3:1': 'GMSave 合并流程正在运行',
   '3:2': 'IDE 有非编辑器的模态对话框（消息框/文件对话框等）',
@@ -1736,7 +1745,7 @@ function toolResult(r) {
   }
   if (r.note) lines.push(r.note);
   if (r.sync && r.sync.status_name) {
-    lines.push(`工程同步：${r.sync.status_name}${r.sync.detail_text ? `（${r.sync.detail_text}）` : ''}`);
+    lines.push(`工程同步：${SYNC_STATUS_ZH[r.sync.status] ?? r.sync.status_name}${r.sync.detail_text ? `（${r.sync.detail_text}）` : ''}`);
   }
   if (r.warnings?.length) r.warnings.forEach((w) => lines.push(`警告：${w}`));
   if (r.instance) lines.push(`目标 IDE：#${r.instance.index} (pid ${r.instance.pid}) ${r.instance.title}`);
@@ -1843,9 +1852,7 @@ async function mcpMain() {
       const ok = s.status === 1 || s.status === 2;
       const text = s.detail_text ? `（${s.detail_text}）` : '';
       const lines = [
-        ok
-          ? `OK：工程同步完成 —— ${name === 'reloaded' ? '已从磁盘重载' : '磁盘与快照一致，无需重载'}`
-          : `同步未完成：${name}${text}`,
+        `工程同步${ok ? '完成' : '未完成'}：${SYNC_STATUS_ZH[s.status] ?? name}${text}`,
         ...(s.status === 4
           ? ['这是无人值守拒绝：需要在 IDE 里人工处理（保存/关闭编辑器/解决冲突）后重试']
           : []),
