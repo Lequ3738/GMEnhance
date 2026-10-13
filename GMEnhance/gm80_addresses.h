@@ -114,3 +114,27 @@
 // No writer found for this byte yet; semantics pending runtime confirmation.
 // Zero rooms -> pipeline pops a GBK message stored at 0x5DBFE8.
 // "Run" submenu command IDs as shipped: 79 (run), 80 (debug).
+
+// ==== DPI-aware form scaling (unblock VCL auto-scale) ====
+// A form's Scaled property and PixelsPerInch share one field: TCustomForm
+// +0x2A4 (0 = Scaled false; SetScaled sub_478B54 stores Screen.PixelsPerInch
+// there for true). TCustomForm.Create zeroes the field, and SetPixelsPerInch
+// (sub_478A44) drops the DFM's `PixelsPerInch = 96` while csLoading whenever
+// the field is still 0, so every form stays Scaled=false and the creation
+// scaler sub_476B88 (scales font + ClientWidth/Height by Screen.PixelsPerInch
+// / form PixelsPerInch, Screen ptr @0x5EE5C0, PPI @ +0x40) never runs.
+//   478A64  cmp dword ptr [ebx+2A4h], 0
+//   478A6B  jz  short <ret>     ; 74 06 — the drop
+// NOPing the jz (90 90) lets the DFM value land; Scaled turns true and forms
+// in a DPI-aware process scale by Screen.PixelsPerInch / 96. At 96 DPI the
+// ratio is 1 and behavior is unchanged. 8.0 only (8.1 unmapped).
+//
+// The stream ALSO applies `Scaled = False` AFTER PixelsPerInch (the runtime
+// DFM stream is not the exe RCDATA — the RCDATA has no Scaled at all), which
+// zeroed the field again. SetScaled (sub_478B54) is only ever reached through
+// RTTI streaming (no direct callers; every startup call logs val=0), so its
+// entry is patched to an immediate return: the DFM's Scaled=false is ignored
+// and the field keeps the streamed PixelsPerInch. Verified live: forms then
+// scale (TMainForm ClientWidth 784 -> 965 at 125%).
+#define ADDR_SETPIXELSPERINCH_JZ   0x78A6B   // 0x478A6B, expect 74 06, patch 90 90
+#define ADDR_SETSCALED_ENTRY       0x78B54   // 0x478B54, expect 53 56 8B DA 8B F0, patch C3 (ret)

@@ -54,6 +54,7 @@ const FindWindowW = user32.func('__stdcall', 'FindWindowW', 'void *', ['str16', 
 const FindWindowExW = user32.func('__stdcall', 'FindWindowExW', 'void *', ['void *', 'void *', 'str16', 'str16']);
 const IsWindow = user32.func('__stdcall', 'IsWindow', 'int', ['void *']);
 const GetWindowTextW = user32.func('__stdcall', 'GetWindowTextW', 'int', ['void *', koffi.out(koffi.pointer('uint16')), 'int']);
+const SendMessageW = user32.func('__stdcall', 'SendMessageW', 'intptr', ['void *', 'uint32', 'uintptr', 'void *']);
 const GetWindowThreadProcessId = user32.func('__stdcall', 'GetWindowThreadProcessId', 'uint32', ['void *', koffi.out(koffi.pointer('uint32'))]);
 const GetMenu = user32.func('__stdcall', 'GetMenu', 'void *', ['void *']);
 const GetMenuItemCount = user32.func('__stdcall', 'GetMenuItemCount', 'int', ['void *']);
@@ -134,6 +135,8 @@ const MF_GRAYED_OR_DISABLED = 0x3;
 const MF_SEPARATOR = 0x800;
 const WM_COMMAND = 0x111;
 const WM_CLOSE = 0x10;
+const WM_GETTEXT = 0x000D;
+const WM_GETTEXTLENGTH = 0x000E;
 const TH32CS_SNAPPROCESS = 0x2;
 const TH32CS_SNAPMODULE = 0x8;
 const TH32CS_SNAPMODULE32 = 0x10; // 64 位进程枚举 32 位（WOW64）目标模块必需
@@ -171,6 +174,19 @@ function windowTitle(hwnd) {
   const buf = Buffer.alloc(512);
   const n = GetWindowTextW(hwnd, buf, 256);
   return n > 0 ? buf.toString('utf16le', 0, n * 2) : '';
+}
+
+// GetWindowText 跨进程不发消息、只拷窗口结构缓存的标题，经 EM 系消息填充内容的
+// EDIT 类控件（如错误框的 TMemo）读出来恒为空；须向目标窗口发 WM_GETTEXT 取真实文本。
+// SendMessage 同步等目标线程回复，仅用于弹窗探测这类目标线程必然存活泵消息的场景。
+function windowText(hwnd) {
+  const len = Number(SendMessageW(hwnd, WM_GETTEXTLENGTH, 0, null));
+  if (len > 0) {
+    const buf = Buffer.alloc((len + 1) * 2);
+    const n = Math.min(Number(SendMessageW(hwnd, WM_GETTEXT, len + 1, buf)), len);
+    if (n > 0) return buf.toString('utf16le', 0, n * 2);
+  }
+  return windowTitle(hwnd);
 }
 
 function windowClassName(hwnd) {
@@ -302,9 +318,10 @@ export function gamesRunning() {
 
 /**
  * 读取指定 IDE 实例（及其启动的游戏进程）下的指定类名顶层可见弹窗，并枚举其全部
- * 子控件（类名/文本/矩形/可见性）。默认覆盖三类弹窗：TErrorForm = IDE 侧错误框
- * （正文在子控件文本里，可全文抓取）；TMessageForm = Delphi 消息框（游戏运行时错误、
- * 资源错误等，正文画在窗体 Canvas 上不落子控件——只能抓到标题与按钮，正文需配截图）；
+ * 子控件（类名/文本/矩形/可见性）。默认覆盖三类弹窗：TErrorForm = IDE 编译错误/
+ * 游戏运行时代码错误框（正文在 TMemo 里，经 WM_GETTEXT 全文抓取）；
+ * TMessageForm = Delphi 消息框（资源错误等，正文画在窗体 Canvas 上不落子控件——
+ * 只能抓到标题与按钮，正文需配截图）；
  * #32770 = Windows 标准对话框（保存冲突三选框等）。只读，不点任何按钮。
  */
 const DEFAULT_DIALOG_CLASSES = 'TErrorForm,TMessageForm,#32770';
@@ -337,7 +354,7 @@ export function readDialogs(instance, className) {
       for (let c = FindWindowExW(h, null, null, null); c; c = FindWindowExW(h, c, null, null)) {
         controls.push({
           class: windowClassName(c),
-          text: windowTitle(c),
+          text: windowText(c),
           rect: windowRect(c),
           visible: !!IsWindowVisible(c),
         });
@@ -2085,9 +2102,9 @@ async function mcpMain() {
       title: '读取 GM8 弹窗文本',
       description:
         '读取指定 IDE 实例（及其启动的游戏进程）下的全部可见弹窗并抓取结构：' +
-        '默认覆盖 TErrorForm（IDE 错误框，正文可全文抓取）、TMessageForm（Delphi 消息框：' +
-        '游戏运行时错误/资源错误，正文画在窗体 Canvas 上抓不到子控件文本，只能拿标题+按钮，' +
-        '正文配截图工具）与 #32770（Windows 标准对话框，保存冲突三选框等）。' +
+        '默认覆盖 TErrorForm（IDE 编译错误/游戏运行时代码错误框，正文在 TMemo 里可全文抓取）、' +
+        'TMessageForm（Delphi 消息框：资源错误等，正文画在窗体 Canvas 上无文本控件，' +
+        '只能拿标题+按钮，正文配截图工具）与 #32770（Windows 标准对话框，保存冲突三选框等）。' +
         '返回每个弹窗的全部子控件（类名/文本/矩形/可见性）。只读，不点任何按钮；' +
         '没有弹窗时正常返回 count:0。用于无人值守排查 run_* 失败原因、确认弹窗内容后' +
         '再决定代答方式（按钮代答可用 external_click / modal_dismiss，' +

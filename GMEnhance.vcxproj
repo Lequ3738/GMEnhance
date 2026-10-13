@@ -53,6 +53,8 @@
     <ClInclude Include="GMEnhance\code_hint.h" />
     <ClInclude Include="GMEnhance\completion.h" />
     <ClInclude Include="GMEnhance\middle_click.h" />
+    <ClInclude Include="GMEnhance\dpi_aware.h" />
+    <ClInclude Include="GMEnhance\settings.h" />
     <ClInclude Include="GMEnhance\ide_hooks.h" />
   </ItemGroup>
   <ItemGroup>
@@ -61,6 +63,8 @@
     <ClCompile Include="GMEnhance\code_hint.cpp" />
     <ClCompile Include="GMEnhance\completion.cpp" />
     <ClCompile Include="GMEnhance\middle_click.cpp" />
+    <ClCompile Include="GMEnhance\dpi_aware.cpp" />
+    <ClCompile Include="GMEnhance\settings.cpp" />
     <ClCompile Include="GMEnhance\ide_hooks.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

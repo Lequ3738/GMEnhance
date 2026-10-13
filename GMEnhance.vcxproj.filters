@@ -16,6 +16,8 @@
     <ClInclude Include="GMEnhance\code_hint.h"><Filter>头文件\Project</Filter></ClInclude>
     <ClInclude Include="GMEnhance\completion.h"><Filter>头文件\Project</Filter></ClInclude>
     <ClInclude Include="GMEnhance\middle_click.h"><Filter>头文件\Project</Filter></ClInclude>
+    <ClInclude Include="GMEnhance\dpi_aware.h"><Filter>头文件\Project</Filter></ClInclude>
+    <ClInclude Include="GMEnhance\settings.h"><Filter>头文件\Project</Filter></ClInclude>
     <ClInclude Include="GMEnhance\ide_hooks.h"><Filter>头文件\Project</Filter></ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -25,6 +27,8 @@
     <ClCompile Include="GMEnhance\code_hint.cpp"><Filter>源文件\IDE Hooks</Filter></ClCompile>
     <ClCompile Include="GMEnhance\completion.cpp"><Filter>源文件\IDE Hooks</Filter></ClCompile>
     <ClCompile Include="GMEnhance\middle_click.cpp"><Filter>源文件\IDE Hooks</Filter></ClCompile>
+    <ClCompile Include="GMEnhance\dpi_aware.cpp"><Filter>源文件\IDE Hooks</Filter></ClCompile>
+    <ClCompile Include="GMEnhance\settings.cpp"><Filter>源文件\Core</Filter></ClCompile>
     <ClCompile Include="GMEnhance\ide_hooks.cpp"><Filter>源文件\IDE Hooks</Filter></ClCompile>
   </ItemGroup>
 </Project>
