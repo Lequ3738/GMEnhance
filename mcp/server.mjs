@@ -15,6 +15,11 @@
 // 不弹任何 UI），结果写进命名文件映射 Local\GMSave.SyncStatus.<pid> 供本进程
 // 轮询读取。零脏 ⇒ local==base ⇒ 冲突不可能，纯 AI 循环保证静默重载。
 //
+// 静默租约（GMSave.SetQuiet）：MCP 触发的操作一律不在 IDE 里弹模态窗。sync/run/
+// save 前向同一 Watcher 窗口投递注册消息 GMSave.SetQuiet（wParam=租约毫秒，0=清除），
+// GMSave 在租约期内把原本要弹的提示抑制成记录（结果块尾部的 uiKind/uiSeq），由本
+// 进程回报成结构化结果（code 5 + suppressed）。手动操作不授租约，行为不变。
+//
 // 多实例：游戏进程由 IDE 直接 CreateProcess，父进程即发起运行的 IDE，
 // 用 ppid 归因，多 IDE 同时开游戏也不会误报。多个 IDE 在跑时必须用
 // instance 参数（序号或工程标题子串）指定目标，否则拒绝执行。
@@ -115,18 +120,35 @@ const PROCESSENTRY32W = koffi.struct('PROCESSENTRY32W', {
 const Process32FirstW = kernel32.func('__stdcall', 'Process32FirstW', 'int', ['void *', koffi.inout(koffi.pointer(PROCESSENTRY32W))]);
 const Process32NextW = kernel32.func('__stdcall', 'Process32NextW', 'int', ['void *', koffi.inout(koffi.pointer(PROCESSENTRY32W))]);
 
-// GMSave ForceSync 结果块（16 字节，布局见 GMSave project_watcher.cpp）。
-// reqId 由 GMSave 最后写入，作为"本次请求已完成"的提交标记。
+// GMSave 结果块（28 字节，布局见 GMSave project_watcher.cpp）。
+// 前 16 字节是旧协议：reqId 由 GMSave 最后写入，作为"本次请求已完成"的提交标记。
+// 尾部 caps/uiKind/uiSeq 是静默租约的扩展位；旧版 GMSave 的映射对象只有 16 字节，
+// 但映射按页对齐，读到的尾部是零，caps=0 即"不支持静默"——无需按尺寸探测。
 const GM_SYNC_BLOCK = koffi.struct('GM_SYNC_BLOCK', {
   magic: 'uint32',
   reqId: 'uint32',
   status: 'uint32',
   detail: 'uint32',
+  caps: 'uint32',
+  uiKind: 'uint32',
+  uiSeq: 'uint32',
 });
 const GM_SYNC_MAGIC = 0x47534d31; // 'GMS1'
+const GM_SYNC_BLOCK_SIZE = 28;
+const GM_SYNC_CAP_QUIET = 0x1; // caps bit0 = 支持 SetQuiet 租约
 const FILE_MAP_READ = 0x4;
 // 同一字符串系统级注册出同一消息 id；GMSave 侧在创建隐藏窗口时注册同名消息。
 const MSG_FORCE_SYNC = RegisterWindowMessageW('GMSave.ForceSync');
+const MSG_SET_QUIET = RegisterWindowMessageW('GMSave.SetQuiet');
+
+// 被抑制的 UI 种类（GMSave 写进结果块 uiKind 的值）→ 回报用短名
+const UI_KIND = {
+  1: 'save-disk-differs',
+  2: 'save-failed',
+  3: 'load-diagnostics',
+  4: 'load-fatal',
+  5: 'merge-editor-gate',
+};
 
 // ---------- 小工具 ----------
 
@@ -430,7 +452,7 @@ const SYNC_DETAIL = {
   '4:2': 'IDE 存在未保存的修改（标题栏 * ）——合并流的确认弹窗需要人回答',
   // GM8 Delphi MM 池锁卡死（GMSave mm_audit）：重载会卡进 GM 自己的 CAS 自旋，
   // 永久未响应——GMSave 主动拒绝。恢复：重启 IDE；或外部解锁后重试
-  // （GMEnhance/mcp/poolpoison.mjs unlockall <pid>，现场记录 %TEMP%\GMSave_MMBroken.txt）
+  // （池表锁字节的排障工具已从本仓库移除，现场记录见 %TEMP%\GMSave_MMBroken.txt）
   '4:3': 'IDE 内存管理器卡死（内部堆锁未释放）——重载会永久未响应，已拒绝；请重启 IDE',
   '6:1': '合并基线缺失：GMSave 已就地重建基线并跳过本轮，本次外部改动未应用——' +
     '把改动重做（或再改一笔）后再 sync 即可正常合并',
@@ -454,9 +476,67 @@ export function findWatcherWindows() {
 let syncSeq = ((process.pid ^ Date.now()) & 0x7fffffff) | 1;
 
 /**
+ * 打开该 IDE 的同步结果映射并映射视图。
+ * 一律按 28 字节映射：旧版 GMSave 的映射对象只有 16 字节，但 Windows 按页
+ * 粒度映射整个视图，请求 28 字节同样成功，尾部读到的是零（离页内，不会 AV）。
+ * 因此不需要"按尺寸回退"的探测——旧版的 caps 读到 0，正好就是"不支持静默"。
+ * 返回 { hmap, view }；通道不存在/映射失败返回 null（句柄已清）。
+ */
+function openSyncView(pid) {
+  const hmap = OpenFileMappingW(FILE_MAP_READ, 0, `Local\\GMSave.SyncStatus.${pid}`);
+  if (!hmap) return null;
+  const view = MapViewOfFile(hmap, FILE_MAP_READ, 0, 0, GM_SYNC_BLOCK_SIZE);
+  if (view) return { hmap, view };
+  CloseHandle(hmap);
+  return null;
+}
+
+function closeSyncView(s) {
+  if (!s) return;
+  if (s.view) UnmapViewOfFile(s.view);
+  CloseHandle(s.hmap);
+}
+
+function decodeSyncBlock(s) {
+  return koffi.decode(s.view, GM_SYNC_BLOCK);
+}
+
+/**
+ * 给目标 IDE 授予/清除静默租约（wParam=租约毫秒数，0=立即清除）。
+ * 租约期内 GMSave 把原本要弹的模态提示抑制成记录（经 uiKind/uiSeq 回报），
+ * 让 MCP 通道的结构化结果取代需要人回答的窗口。
+ * 失败静默返回 false（消息 id 为 0 / 找不到 Watcher 窗口 / PostMessage 失败）：
+ * 老构建没有此能力，调用方照常继续。
+ */
+export function setQuiet(pid, leaseMs) {
+  if (!MSG_SET_QUIET) return false;
+  const watcher = findWatcherWindows().find((w) => w.pid === pid);
+  if (!watcher) return false;
+  const ms = Math.max(0, Math.floor(Number(leaseMs) || 0));
+  return !!PostMessageW(watcher.hwnd, MSG_SET_QUIET, ms, null);
+}
+
+/**
+ * 只读探测静默状态：{ caps, uiKind, uiSeq }；通道不存在或 magic 不符返回 null。
+ * caps bit0 置位表示对端支持 SetQuiet 租约；旧版 GMSave（16 字节映射）三项恒为 0。
+ */
+export function readQuietState(pid) {
+  const s = openSyncView(pid);
+  if (!s) return null;
+  try {
+    const blk = decodeSyncBlock(s);
+    if (blk.magic !== GM_SYNC_MAGIC) return null;
+    return { caps: blk.caps, uiKind: blk.uiKind, uiSeq: blk.uiSeq };
+  } finally {
+    closeSyncView(s);
+  }
+}
+
+/**
  * 让指定 IDE 进程里的 GMSave 立即执行一次外部改动合并/重载（跳过前台门）。
- * 投递注册消息 GMSave.ForceSync（wParam=请求 id），轮询命名文件映射直到
- * reqId 匹配。返回对象三态：
+ * 投递前先授予静默租约，覆盖本轮合并流可能遇到的提示；再投递注册消息
+ * GMSave.ForceSync（wParam=请求 id），轮询命名文件映射直到 reqId 匹配。
+ * 返回对象三态：
  *   supported=false  通道不存在（GMSave 旧于 ForceSync / 未载入 / 无窗口）
  *   timeout          已投递但等不到结果（IDE 主线程被长时间占用）
  *   其余             { status, status_name, detail, detail_text }
@@ -490,21 +570,20 @@ export async function syncProject(pid, timeoutMs = 20000) {
       reason: '该 IDE 进程没有 GMSave.Watcher 窗口（GMSave.dll 未部署或未加载）',
     };
   }
-  const hmap = OpenFileMappingW(FILE_MAP_READ, 0, `Local\\GMSave.SyncStatus.${pid}`);
-  if (!hmap) {
+  const s = openSyncView(pid);
+  if (!s) {
     return {
       supported: false,
       reason: '打不开 GMSave 同步通道：GMSave.dll 旧于 ForceSync 版本',
     };
   }
-  let view = null;
   try {
-    view = MapViewOfFile(hmap, FILE_MAP_READ, 0, 0, 16);
-    if (!view) return { supported: false, reason: 'MapViewOfFile 失败' };
-    const head = koffi.decode(view, GM_SYNC_BLOCK);
+    const head = decodeSyncBlock(s);
     if (head.magic !== GM_SYNC_MAGIC) {
       return { supported: false, reason: `同步通道 magic 不符（${head.magic}）` };
     }
+    // 合并流可能撞上需要提示的状态：先授租约，让提示被抑制并记录，而不是弹窗
+    setQuiet(pid, timeoutMs + 15000);
     const reqId = (syncSeq = ((syncSeq + 1) & 0x7fffffff) | 1) >>> 0;
     if (!PostMessageW(watcher.hwnd, MSG_FORCE_SYNC, reqId, null)) {
       return { supported: false, reason: 'PostMessage(GMSave.ForceSync) 失败' };
@@ -512,7 +591,7 @@ export async function syncProject(pid, timeoutMs = 20000) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       await sleep(120);
-      const blk = koffi.decode(view, GM_SYNC_BLOCK);
+      const blk = decodeSyncBlock(s);
       if (blk.reqId === reqId) {
         return {
           supported: true,
@@ -534,18 +613,22 @@ export async function syncProject(pid, timeoutMs = 20000) {
       reason: `已投递 ForceSync（req ${reqId}）但 ${timeoutMs}ms 内没有结果；IDE 主线程可能被长操作占用`,
     };
   } finally {
-    if (view) UnmapViewOfFile(view);
-    CloseHandle(hmap);
+    closeSyncView(s);
   }
 }
 
 /** status 汇报用：该 IDE 的同步通道就绪状态（只探测，不投递） */
 export function syncCapability(pid) {
   if (!findWatcherWindows().some((w) => w.pid === pid)) return 'no-watcher';
-  const hmap = OpenFileMappingW(FILE_MAP_READ, 0, `Local\\GMSave.SyncStatus.${pid}`);
-  if (!hmap) return 'no-channel';
-  CloseHandle(hmap);
-  return 'ready';
+  const s = openSyncView(pid);
+  if (!s) return 'no-channel';
+  try {
+    const blk = decodeSyncBlock(s);
+    if (blk.magic !== GM_SYNC_MAGIC) return 'no-channel';
+    return blk.caps & GM_SYNC_CAP_QUIET ? 'ready+quiet' : 'ready';
+  } finally {
+    closeSyncView(s);
+  }
 }
 
 // ---------- 核心：当前工程路径（纯外部 RPM 读取） ----------
@@ -1119,7 +1202,13 @@ export async function openProject({ path: projPath, timeoutMs = 30000 } = {}) {
   const before = new Set(findIdeWindows().map((w) => w.pid));
   let child;
   try {
-    child = nodeSpawn(exe, [arg.file], { detached: true, stdio: 'ignore' });
+    // GMSAVE_QUIET_MS：让新进程在启动加载期也处于静默租约内，把诊断/扩展缺失
+    // 这类提示抑制成记录而不是弹窗（GMSave 载入后自行读取该环境变量）
+    child = nodeSpawn(exe, [arg.file], {
+      detached: true,
+      stdio: 'ignore',
+      env: { ...process.env, GMSAVE_QUIET_MS: String(timeoutMs) },
+    });
     child.unref();
   } catch (e) {
     return { ok: false, code: 1, reason: `启动 Game_Maker.exe 失败：${e.message}`, exe };
@@ -1196,10 +1285,12 @@ function readIdeDirty(pid) {
 }
 
 /**
- * 请求一个 IDE 实例退出（WM_CLOSE，等同点 IDE 的 X）：有未保存修改时 GM 会弹
- * 自己的保存确认框等人工处理，这是预期行为，工具只负责把状态如实报告。
+ * 请求一个 IDE 实例退出（WM_CLOSE，等同点 IDE 的 X）。
+ * MCP 通道不弹模态窗：关闭前读 GM 脏标志预检，有未保存修改时直接拒绝（code 5），
+ * 因为 WM_CLOSE 会让 GM 弹自己的保存确认框等人工处理。需要放弃未保存内容时
+ * 传 discardUnsaved=true，直接 TerminateProcess 结束该 IDE。
  */
-export async function closeIde({ instance, timeoutMs = 10000, stopGames: stopGamesFirst = false } = {}) {
+export async function closeIde({ instance, timeoutMs = 10000, stopGames: stopGamesFirst = false, discardUnsaved = false } = {}) {
   const wins = findIdeWindows();
   if (!wins.length) {
     return { ok: false, code: 1, reason: '没找到任何 GameMaker 8.0 主窗口（TMainForm），IDE 未运行？' };
@@ -1215,6 +1306,63 @@ export async function closeIde({ instance, timeoutMs = 10000, stopGames: stopGam
   const gamesNote = games.length
     ? `该 IDE 启动的 ${games.length} 个游戏进程不受关闭影响，仍在运行（可用 stop_game 关闭）`
     : null;
+  if (dirty === true && !discardUnsaved) {
+    return {
+      ok: false,
+      code: 5,
+      closed: false,
+      unsaved_changes: true,
+      reason: 'IDE 有未保存修改，关闭会弹出 GM 自己的保存确认框——MCP 通道不弹模态窗，已拒绝',
+      hint: '先在 IDE 保存（或用 save_project），或传 discard_unsaved:true 强制结束进程（未保存内容会丢失）',
+      ...(gamesNote ? { note: gamesNote } : {}),
+      instance: briefInstance(ide, idx),
+    };
+  }
+  if (dirty === true && discardUnsaved) {
+    // 强制路径：不投 WM_CLOSE（会弹保存确认框），直接结束进程。未保存内容丢失
+    // 是调用方显式选择的结果。带 SYNCHRONIZE 才能在结束后有限等待其真正退出。
+    if (stopGamesFirst && games.length) {
+      await stopGames({ instance, graceMs: 3000 });
+    }
+    const h = OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, ide.pid);
+    if (!h) {
+      return {
+        ok: false,
+        code: 6,
+        closed: false,
+        unsaved_changes: true,
+        reason: `OpenProcess(PROCESS_TERMINATE) 失败，无法强制结束 IDE (pid ${ide.pid})`,
+        instance: briefInstance(ide, idx),
+      };
+    }
+    let killed = false;
+    try {
+      killed = !!TerminateProcess(h, 1);
+      if (killed) WaitForSingleObject(h, Math.min(timeoutMs, 5000));
+    } finally {
+      CloseHandle(h);
+    }
+    if (!killed) {
+      return {
+        ok: false,
+        code: 6,
+        closed: false,
+        unsaved_changes: true,
+        reason: `TerminateProcess 失败，IDE (pid ${ide.pid}) 仍在运行`,
+        instance: briefInstance(ide, idx),
+      };
+    }
+    return {
+      ok: true,
+      code: 0,
+      headline: 'OK：IDE 实例已强制结束（未保存内容已丢弃）',
+      closed: true,
+      forced: true,
+      unsaved_changes: true,
+      ...(gamesNote ? { note: gamesNote } : {}),
+      instance: briefInstance(ide, idx),
+    };
+  }
   if (stopGamesFirst && games.length) {
     await stopGames({ instance, graceMs: 3000 });
   }
@@ -1236,11 +1384,9 @@ export async function closeIde({ instance, timeoutMs = 10000, stopGames: stopGam
       };
     }
   }
-  const hint = dirty === true
-    ? '关闭前检测到未保存修改（标题栏 * ），IDE 大概率弹了保存确认对话框等人工处理——这是预期行为'
-    : dirty === false
-      ? '未检测到未保存修改，但 IDE 没有退出——可能弹了其他对话框，需人工查看'
-      : 'IDE 没有退出，大概率弹了保存确认或其他对话框等人工处理';
+  const hint = dirty === false
+    ? '未检测到未保存修改，但 IDE 没有退出——可能弹了其他对话框，需人工查看'
+    : 'IDE 没有退出，大概率弹了其他对话框等人工处理';
   return {
     ok: false,
     code: 6,
@@ -1398,6 +1544,9 @@ export async function runGame(kind, timeoutMs = 30000, instance, prefile) {
   // 触发前记录该 IDE 自己的游戏进程，之后新出现的才算本次启动；
   // ppid 归因保证另一个 IDE（或其游戏）的变化不会被误判。
   const before = new Set(gamesRunning().filter((g) => g.ppid === ide.pid).map((g) => g.pid));
+  // 编译运行阶段全程处于静默租约内：GMSave 在此期间遇到的提示一律抑制成记录，
+  // 不弹模态窗（编译错误框是游戏进程弹的，不在租约覆盖范围，保持超时语义）。
+  setQuiet(ide.pid, timeoutMs + 15000);
   if (!PostMessageW(ide.hwnd, WM_COMMAND, item.id, null)) {
     if (prefileFile) { try { fs.unlinkSync(prefileFile); } catch { /* 已不在=无事可做 */ } }
     return { ok: false, code: 3, reason: 'PostMessage 失败' };
@@ -1492,8 +1641,11 @@ function titleDirtyFlag(title) {
 // 触发 IDE 的"保存工程"（等同 Ctrl+S / 文件 > 保存）：WM_COMMAND 直投保存
 // 菜单项（Save1Click 无 dirty 检查，干净状态触发也会完整走一遍保存流程）。
 // 完成信号 = 标题未保存标记消失（保存成功由 IDE/GMSave 移除）；本来干净时
-// 触发后星号无变化，短等一轮确认窗口还活着即返回。超时多半是 IDE 弹了
-// 保存冲突三选框/错误框等人工确认（Debug 版可查 %TEMP%\GMSave.log）。
+// 触发后星号无变化，短等一轮确认窗口还活着即返回。
+//
+// 保存流程的模态提示（磁盘差异三选框、保存失败框等）一律不弹：先 sync 把磁盘
+// 外部改动合并掉（从源头避免差异提示），再授静默租约；被抑制的提示由 GMSave
+// 记进 uiSeq/uiKind，等待循环里发现 uiSeq 变化即按 code 5 结构化回报。
 export async function saveProject(instance, timeoutMs = 60000) {
   const wins = findIdeWindows();
   if (!wins.length) {
@@ -1504,44 +1656,87 @@ export async function saveProject(instance, timeoutMs = 60000) {
     return { ok: false, code: 4, reason: r.reason, instances: wins.map(briefInstance) };
   }
   const ide = r.target;
+  const idx = wins.indexOf(ide);
+
+  // 前置同步：磁盘外部改动先合并进 IDE 内存，保存钩子就不会撞上"磁盘与内存
+  // 不一致"的三选框。状态 1/2 视为已同步；其它状态（4/6/超时/通道不可用）
+  // 不中止保存，原样放进结果的 pre_sync 字段供上层判断。
+  let preSync;
+  try {
+    preSync = await syncProject(ide.pid, Math.min(20000, timeoutMs));
+  } catch (e) {
+    preSync = { supported: false, reason: `同步调用异常：${e?.message ?? e}` };
+  }
+  const synced = preSync.status === 1 || preSync.status === 2;
 
   // 提示框（保存冲突三选/错误框等，类名 #32770）打开期间再投保存命令，
   // 保存钩子会在对话框的消息循环里重入并叠出第二个一模一样的提示——实测
-  // 连续三次触发叠了两个。无人值守调用应先处理对话框，拒绝比堆叠安全。
+  // 连续三次触发叠了两个。租约只能抑制新提示，已有的仍须人工处理。
   if (modalDialogOpen(ide.pid)) {
     return {
       ok: false, code: 5,
       reason: 'IDE 有模态对话框处于打开状态（可能是保存冲突提示或错误框），' +
         '再投保存命令会把保存流程重入并叠出新提示框',
-      hint: '先人工或经外部工具处理该对话框（确定/取消/是/否），再重试保存',
-      instance: briefInstance(ide, wins.indexOf(ide)),
+      hint: '先人工处理该对话框（确定/取消/是/否），再重试保存',
+      synced, pre_sync: preSync,
+      instance: briefInstance(ide, idx),
     };
   }
 
   const id = pickSaveCommandId(ide.hwnd);
   if (id == null) {
-    return { ok: false, code: 2, reason: '菜单结构里没定位到"文件 > 保存"（已知 id 与结构签名都未命中）' };
+    return {
+      ok: false, code: 2,
+      reason: '菜单结构里没定位到"文件 > 保存"（已知 id 与结构签名都未命中）',
+      synced, pre_sync: preSync,
+    };
   }
 
+  setQuiet(ide.pid, timeoutMs + 15000);
+  const preSyncUi = readQuietState(ide.pid);
   const title0 = windowTitle(ide.hwnd);
   const dirty0 = titleDirtyFlag(title0);
+  // 等待循环与干净路径共用的抑制判定：uiSeq 相对投递前变化 = 保存流程中出现了
+  // 需要人工决策的状态（已被 GMSave 抑制成记录），按 code 5 返回而不是干等超时。
+  const suppressedResult = (ui) => ({
+    ok: false,
+    code: 5,
+    suppressed: UI_KIND[ui.uiKind] || String(ui.uiKind),
+    reason: 'IDE 在保存流程中抑制了一个模态提示（说明遇到了需要人工决策的状态），已按静默模式拒绝',
+    hint: '先 sync_project 合并外部改动，或人工处理后再重试',
+    pre_sync: preSync,
+    dirty_before: dirty0,
+    item_id: id,
+    synced,
+    instance: briefInstance(ide, idx),
+  });
+  const quietUiChanged = () => {
+    const ui = readQuietState(ide.pid);
+    return ui && preSyncUi && ui.uiSeq !== preSyncUi.uiSeq ? ui : null;
+  };
+
   const t0 = Date.now();
   if (!PostMessageW(ide.hwnd, WM_COMMAND, id, null)) {
-    return { ok: false, code: 3, reason: 'PostMessage 失败' };
+    return { ok: false, code: 3, reason: 'PostMessage 失败', pre_sync: preSync };
   }
 
   if (!dirty0) {
     // 干净状态：保存流程照跑（重写 index/settings 等），但标题不动。
-    // 给一个短等待窗口确认 IDE 没当场退出/弹框即可。
+    // 给一个短等待窗口确认 IDE 没当场退出/弹框即可；窗口内被抑制的提示
+    // 同样算失败（修掉"2 秒内弹框也报成功"的假成功）。
     await sleep(2000);
     if (!IsWindow(ide.hwnd)) {
-      return { ok: false, code: 1, reason: '触发后 IDE 主窗口消失了' };
+      return { ok: false, code: 1, reason: '触发后 IDE 主窗口消失了', pre_sync: preSync };
     }
+    const ui = quietUiChanged();
+    if (ui) return suppressedResult(ui);
     return {
       ok: true, code: 0, dirty_before: false, saved_flag: false,
+      headline: 'OK：已触发完整保存流程（标题本来就没有未保存标记）',
       item_id: id, elapsed_ms: Date.now() - t0,
+      synced, pre_sync: preSync,
       note: '标题无未保存标记（可能本来就没有修改）；已触发完整保存流程',
-      instance: briefInstance(ide, wins.indexOf(ide)),
+      instance: briefInstance(ide, idx),
     };
   }
 
@@ -1549,13 +1744,17 @@ export async function saveProject(instance, timeoutMs = 60000) {
   while (Date.now() < deadline) {
     await sleep(300);
     if (!IsWindow(ide.hwnd)) {
-      return { ok: false, code: 1, reason: '保存过程中 IDE 主窗口消失了' };
+      return { ok: false, code: 1, reason: '保存过程中 IDE 主窗口消失了', pre_sync: preSync };
     }
+    const ui = quietUiChanged();
+    if (ui) return suppressedResult(ui);
     if (!titleDirtyFlag(windowTitle(ide.hwnd))) {
       return {
         ok: true, code: 0, dirty_before: true, saved_flag: true,
+        headline: 'OK：工程已保存（标题未保存标记消失）',
         item_id: id, elapsed_ms: Date.now() - t0,
-        instance: briefInstance(ide, wins.indexOf(ide)),
+        synced, pre_sync: preSync,
+        instance: briefInstance(ide, idx),
       };
     }
   }
@@ -1564,7 +1763,8 @@ export async function saveProject(instance, timeoutMs = 60000) {
     reason: `已触发保存（id 0x${id.toString(16)}），但 ${timeoutMs}ms 内标题未保存标记未消失；` +
       '大概率 IDE 弹了保存冲突三选框/错误框等人工确认，或保存超过超时（大工程全量可加大 timeout_ms）',
     dirty_before: true, item_id: id,
-    instance: briefInstance(ide, wins.indexOf(ide)),
+    synced, pre_sync: preSync,
+    instance: briefInstance(ide, idx),
   };
 }
 
@@ -1593,6 +1793,8 @@ function parseArgs(args) {
       out.out = args[++i];
     } else if (args[i] === '--overwrite') {
       out.overwrite = true;
+    } else if (args[i] === '--discard-unsaved') {
+      out.discardUnsaved = true;
     }
   }
   return out;
@@ -1666,7 +1868,11 @@ async function cliMain(argv) {
     return r.code;
   }
   if (cmd === 'close') {
-    const r = await closeIde({ instance: opts.instance, timeoutMs: opts.timeout ?? 10000 });
+    const r = await closeIde({
+      instance: opts.instance,
+      timeoutMs: opts.timeout ?? 10000,
+      discardUnsaved: !!opts.discardUnsaved,
+    });
     console.log(JSON.stringify(r, null, 2));
     return r.code;
   }
@@ -1736,13 +1942,15 @@ async function cliMain(argv) {
     await mcpSelftest();
     return 0;
   }
-  console.error('用法: node server.mjs status|project|sync|run|debug|stop|save|open <工程路径>|close|action <编号|名称>|actions-md|gmspr-unpack <文件.gmspr>|gmspr-pack <精灵文件夹> [--instance 序号|标题] [--timeout 毫秒] [--pid 进程号] [--grace 毫秒] [--prefile 相对路径=内容] [--out 路径] [--overwrite] | mcp-selftest\n' +
+  console.error('用法: node server.mjs status|project|sync|run|debug|stop|save|open <工程路径>|close|action <编号|名称>|actions-md|gmspr-unpack <文件.gmspr>|gmspr-pack <精灵文件夹> [--instance 序号|标题] [--timeout 毫秒] [--pid 进程号] [--grace 毫秒] [--prefile 相对路径=内容] [--out 路径] [--overwrite] [--discard-unsaved] | mcp-selftest\n' +
     '  run/debug 的 --prefile: 启动前把内容写入游戏工作目录下的该相对路径文件（通用机制，语义归调用方）\n' +
     '  gmspr-unpack/gmspr-pack 的 --out/--overwrite: 输出路径与覆盖已存在目标（默认输出到源旁边同名处）\n' +
+    '  close 的 --discard-unsaved: IDE 有未保存修改时不再拒绝，直接结束进程（未保存内容丢失）\n' +
     '  sync 退出码: 0 已同步/无需同步; 5 需人工处理; 6 顺延/超时; 7 通道不可用; 8 合并流失败（非顺延，勿盲目重试）\n' +
     '  stop 退出码: 0 已停止/无游戏; 5 有进程未能停止; 7 pid 不是正在运行的游戏\n' +
     '  open 退出码: 0 已启动并载入; 1 启动失败/exe 找不到; 6 超时; 7 路径参数无效\n' +
-    '  close 退出码: 0 已退出; 6 超时未退出（多半弹了保存确认框等人工）\n' +
+    '  save 退出码: 0 已保存; 2 没定位到保存菜单项; 3 已触发但超时/PostMessage 失败; 5 保存被静默拒绝（有需要人工决策的提示被抑制）\n' +
+    '  close 退出码: 0 已退出; 5 有未保存修改被拒绝（需 --discard-unsaved）; 6 超时未退出\n' +
     '  action 退出码: 0 查到; 1 没找到/解析失败; actions-md 重新生成 ACTIONS.md');
   return 64;
 }
@@ -1755,6 +1963,7 @@ function toolResult(r) {
       (r.ok ? `OK：${r.mode} 已触发，游戏进程 PID ${r.pid}` : `失败（退出码 ${r.code}）：${r.reason}`),
   ];
   if (r.hint) lines.push(r.hint);
+  if (r.suppressed) lines.push(`被抑制的提示：${r.suppressed}`);
   if (r.path) lines.push(`路径：${r.path}`);
   if (r.stopped?.length) {
     r.stopped.forEach((s) =>
@@ -1814,6 +2023,7 @@ async function mcpMain() {
       description:
         '探测全部 GameMaker 8.0 IDE 实例，支持多开。返回每个实例的序号/pid/标题（含工程名）、' +
         '"运行"菜单叶子项的命令 ID 与置灰状态、正在运行的 GM8 游戏进程及其归属 IDE 的 pid。' +
+        'gmsave_sync 取值：no-watcher / no-channel / ready / ready+quiet（后者表示 GMSave 支持静默租约）。' +
         '只读，无副作用；run_game/run_debug 之前可先调用确认实例与参数。',
     },
     async () => {
@@ -1922,9 +2132,11 @@ async function mcpMain() {
     {
       title: '关闭 GM8 IDE 实例',
       description:
-        '请求某个 IDE 实例退出（WM_CLOSE，等同点窗口的 X）。有未保存修改时 GM 会弹自己的' +
-        '保存确认对话框等人工处理，这是预期行为：工具关闭前读 GM 脏标志预检并报告 ' +
-        'unsaved_changes；超时未退出（退出码 6）即说明弹了窗，需人工处理。' +
+        '请求某个 IDE 实例退出（WM_CLOSE，等同点窗口的 X）。MCP 通道不弹模态窗：关闭前读 GM ' +
+        '脏标志预检，有未保存修改时直接拒绝（退出码 5，closed:false，unsaved_changes:true），' +
+        '不投 WM_CLOSE（否则 GM 会弹自己的保存确认框）。确要放弃未保存内容时传 discard_unsaved:true，' +
+        '直接结束该 IDE 进程（未保存内容丢失）。无未保存修改时投 WM_CLOSE 并等待退出，' +
+        '超时未退出（退出码 6）说明弹了其他对话框，需人工处理。' +
         'IDE 关闭不会停止它启动的游戏进程，可用 stop_games 参数先停游戏，或之后用 stop_game。' +
         '多个 IDE 在跑时必须传 instance。',
       inputSchema: {
@@ -1935,15 +2147,24 @@ async function mcpMain() {
           .min(2000)
           .max(120000)
           .optional()
-          .describe('等待 IDE 退出的超时，毫秒；默认 10000。超时未退出多半是弹了保存确认框'),
+          .describe('等待 IDE 退出的超时，毫秒；默认 10000'),
         stop_games: z
           .boolean()
           .optional()
           .describe('关闭前先停止该 IDE 启动的全部游戏进程；默认 false（游戏继续运行）'),
+        discard_unsaved: z
+          .boolean()
+          .optional()
+          .describe('true = 有未保存修改时不再拒绝，直接 TerminateProcess 结束 IDE（未保存内容会丢失）；默认 false'),
       },
     },
-    async ({ instance, timeout_ms, stop_games }) =>
-      toolResult(await closeIde({ instance, timeoutMs: timeout_ms ?? 10000, stopGames: stop_games ?? false })),
+    async ({ instance, timeout_ms, stop_games, discard_unsaved }) =>
+      toolResult(await closeIde({
+        instance,
+        timeoutMs: timeout_ms ?? 10000,
+        stopGames: stop_games ?? false,
+        discardUnsaved: discard_unsaved ?? false,
+      })),
   );
 
   server.registerTool(
@@ -2056,11 +2277,12 @@ async function mcpMain() {
       description:
         '触发某个 GameMaker 8.0 IDE 实例的"正常运行"（等同按 F5）。流程：先用 GMSave 把磁盘上' +
         '的外部改动同步进 IDE 内存（未部署 GMSave 则降级为警告继续），再给 IDE 主窗口投递 ' +
-        'WM_COMMAND 触发编译运行（与用户点菜单同一条路径）。成功返回新游戏进程 PID，' +
+        'WM_COMMAND 触发编译运行（与用户点菜单同一条路径）。触发前会授予静默租约，' +
+        '编译运行阶段 GMSave 原本要弹的提示被抑制成记录而非模态窗。成功返回新游戏进程 PID，' +
         '编译耗时参考 timeout_ms 说明。多个 IDE 在跑时必须传 instance。' +
         '退出码：5 = IDE 有未应用的修改/冲突需人工处理（未运行）；6 = 同步顺延/超时（未运行）；' +
-        '3 = 已触发但超时，大概率 IDE 弹了编译错误对话框等人工确认；' +
-        '8 = prefile 落盘失败（未运行）。',
+        '3 = 已触发但超时，大概率 IDE 弹了编译错误对话框等人工确认（该框由游戏进程弹出，' +
+        '不在静默租约覆盖范围）；8 = prefile 落盘失败（未运行）。',
       inputSchema: runSchema,
     },
     async ({ instance, timeout_ms, prefile }) =>
@@ -2073,7 +2295,7 @@ async function mcpMain() {
       title: '调试运行 GM8 游戏',
       description:
         '触发某个 GameMaker 8.0 IDE 实例的"调试运行"（等同按 F6），带调试器启动游戏。' +
-        '其余语义与 run_game 相同（含前置工程同步、prefile 参数与退出码 5/6）。',
+        '其余语义与 run_game 相同（含前置工程同步、静默租约、prefile 参数与退出码 5/6）。',
       inputSchema: runSchema,
     },
     async ({ instance, timeout_ms, prefile }) =>
@@ -2087,10 +2309,13 @@ async function mcpMain() {
       description:
         '触发某个 GameMaker 8.0 IDE 实例的"保存工程"（等同 Ctrl+S）：给 IDE 主窗口投递 ' +
         'WM_COMMAND 到"文件 > 保存"菜单项（免前台，IDE 在后台也能保存）。按已知命令 ID ' +
-        '定位保存项，回退结构签名。完成判定 = 标题未保存标记消失；标题本来干净时触发后' +
-        '短等确认窗口存活即返回。超时多半是 IDE 弹了保存冲突三选框/错误框等人工确认。' +
+        '定位保存项，回退结构签名。保存前会先自动 sync_project 把磁盘外部改动合并进 IDE 内存' +
+        '（从源头避免保存钩子的磁盘差异三选框），并授予静默租约；完成判定 = 标题未保存标记消失，' +
+        '标题本来干净时触发后短等确认窗口存活即返回。' +
+        '保存流程中被抑制的模态提示（需要人工决策的状态）返回退出码 5 与 suppressed 字段' +
+        '（如 save-disk-differs / save-failed），不干等超时。' +
         '退出码：2 = 没定位到保存菜单项；3 = 已触发但超时/PostMessage 失败；' +
-        '5 = IDE 已有模态对话框（先处理再重试，避免叠框）。',
+        '5 = IDE 已有模态对话框，或保存流程中抑制了提示（按静默模式拒绝）。',
       inputSchema: commonSchema,
     },
     async ({ instance, timeout_ms }) => toolResult(await saveProject(instance, timeout_ms ?? 60000)),
@@ -2105,10 +2330,10 @@ async function mcpMain() {
         '默认覆盖 TErrorForm（IDE 编译错误/游戏运行时代码错误框，正文在 TMemo 里可全文抓取）、' +
         'TMessageForm（Delphi 消息框：资源错误等，正文画在窗体 Canvas 上无文本控件，' +
         '只能拿标题+按钮，正文配截图工具）与 #32770（Windows 标准对话框，保存冲突三选框等）。' +
-        '返回每个弹窗的全部子控件（类名/文本/矩形/可见性）。只读，不点任何按钮；' +
-        '没有弹窗时正常返回 count:0。用于无人值守排查 run_* 失败原因、确认弹窗内容后' +
-        '再决定代答方式（按钮代答可用 external_click / modal_dismiss，' +
-        '保存冲突三选框见 save_project 退出码 5）。',
+        '返回每个弹窗的全部子控件（类名/文本/矩形/可见性）。本工具只读，不点任何按钮。' +
+        'MCP 通道走静默租约不弹窗，被抑制的提示由结果里的 uiKind 回报（save_project 表现为 ' +
+        'code 5 + suppressed 字段）；本工具用于排查游戏进程自己弹出的框（如编译错误）' +
+        '或人工介入后确认现场。没有弹窗时正常返回 count:0。',
       inputSchema: {
         instance: commonSchema.instance,
         class_name: z

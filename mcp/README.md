@@ -29,8 +29,10 @@ GM8 编译用的是 **IDE 内存里**的工程：外部工具改了磁盘上的 
   （无人值守安全：检测到会弹窗的状态——IDE 有未应用修改/模态窗/代码编辑器打开——
   就拒绝执行并回报状态码，不弹任何需要人回答的窗口；零脏 ⇒ local==base ⇒ 冲突不可能，
   纯 AI 循环保证静默重载）；
-- 结果写入命名文件映射 `Local\GMSave.SyncStatus.<pid>`（16 字节：magic 'GMS1'、
-  reqId、status、detail），本进程轮询读取；reqId 最后写，作为完成标记；
+- 结果写入命名文件映射 `Local\GMSave.SyncStatus.<pid>`（28 字节：magic 'GMS1'、
+  reqId、status、detail，尾部 `caps`/`uiKind`/`uiSeq` 为静默租约扩展位），本进程轮询读取；
+  reqId 最后写，作为完成标记；旧版 GMSave 的映射只有 16 字节，读取侧先按 28 字节映射、
+  失败回退 16 字节并把扩展字段视为 0；
 - 通道实现见 GMSave 仓库 `GMSave/project_watcher.cpp` 的 ForceSync 段。
 
 状态码：`1` 已重载、`2` 无需重载（磁盘与 base 快照真一致，可靠语义，可直接当"已同步"）、
@@ -39,6 +41,23 @@ GM8 编译用的是 **IDE 内存里**的工程：外部工具改了磁盘上的 
 缺失，GMSave 已就地重建基线并跳过本轮，重做一次外部改动再 sync 即可；detail `0` = 其余流程
 失败，原因见 GMSave 日志 `%TEMP%\GMSave.log`。`sync` CLI 退出码 8 对应此态）。
 映射打不开 = 部署的 GMSave.dll 旧于 ForceSync 版本。
+
+### 静默租约（MCP 通道不弹模态窗）
+
+MCP 触发的操作一律不在 IDE 里弹模态窗，需要人工决策的状态改为结构化回报：
+
+- `sync_project` / `run_game` / `run_debug` / `save_project` 在投递前向同一
+  `GMSave.Watcher` 窗口投递注册消息 `GMSave.SetQuiet`（wParam = 租约毫秒数，0 = 立即清除），
+  `open_project` 则给新进程带上 `GMSAVE_QUIET_MS` 环境变量覆盖启动加载期；
+- 租约期内 GMSave 把原本要弹的提示抑制成记录（结果块尾部的 `uiKind`/`uiSeq`），
+  不再出现需要人回答的窗口；
+- `save_project` 在等待循环里每轮复查 `uiSeq`：一旦变化立即返回 `code 5` +
+  `suppressed`（`save-disk-differs` / `save-failed` / `load-diagnostics` / `load-fatal` /
+  `merge-editor-gate`），不干等超时；
+- `close_ide` 在 IDE 有未保存修改时直接拒绝（不投 WM_CLOSE，否则 GM 弹保存确认框）；
+  `discard_unsaved:true` 改为直接结束进程；
+- 手动操作不授租约，行为与以前一致；
+- 编译错误框由**游戏进程**弹出，不在租约覆盖范围，仍表现为 `run_*` 超时（退出码 3）。
 
 ### 多实例
 
@@ -81,7 +100,7 @@ npm install
 }
 ```
 
-重启会话后可用工具：`mcp__gm8__status`、`mcp__gm8__sync_project`、`mcp__gm8__run_game`、`mcp__gm8__run_debug`、`mcp__gm8__gmspr_unpack`、`mcp__gm8__gmspr_pack`。
+重启会话后可用工具：`mcp__gm8__status`、`mcp__gm8__sync_project`、`mcp__gm8__run_game`、`mcp__gm8__run_debug`、`mcp__gm8__save_project`、`mcp__gm8__close_ide`、`mcp__gm8__gmspr_unpack`、`mcp__gm8__gmspr_pack`。
 
 ## 工具
 
@@ -89,13 +108,14 @@ npm install
 |---|---|---|
 | `status` | — | 全部 IDE 实例（序号/pid/标题/菜单状态/`project` 工程信息/`gmsave_sync` 通道状态）、正在运行的游戏进程（含归属 IDE 的 ppid） |
 | `get_project` | `instance?` | 读 IDE 当前打开的工程路径（纯外部 RPM 读 GM80_ProjectPath，GBK 解码），附格式与目录 |
-| `open_project` | `path`, `timeout_ms?` | 启动**新** IDE 进程打开工程（等同双击关联文件）：安装路径先读注册表 `HKCU\Software\Game Maker\Version 8\Preferences\Directory`，兜底扫描 Program Files (x86)；等新实例出现并确认载入完成 |
-| `close_ide` | `instance?`, `timeout_ms?`, `stop_games?` | 请求 IDE 退出（WM_CLOSE = 点 X）：关闭前读 GM 脏标志预检 `unsaved_changes`；有未保存修改时 GM 弹自己的保存确认框等人工处理（预期行为），超时未退出即报退出码 6 |
+| `open_project` | `path`, `timeout_ms?` | 启动**新** IDE 进程打开工程（等同双击关联文件）：安装路径先读注册表 `HKCU\Software\Game Maker\Version 8\Preferences\Directory`，兜底扫描 Program Files (x86)；等新实例出现并确认载入完成。启动时带 `GMSAVE_QUIET_MS` 环境变量，加载期的诊断/扩展缺失提示被抑制成记录 |
+| `close_ide` | `instance?`, `timeout_ms?`, `stop_games?`, `discard_unsaved?` | 请求 IDE 退出（WM_CLOSE = 点 X）。MCP 通道不弹模态窗：关闭前读 GM 脏标志预检，有未保存修改时直接拒绝（退出码 5、`closed:false`、`unsaved_changes:true`），不投 WM_CLOSE；`discard_unsaved:true` 则直接 TerminateProcess（未保存内容丢失，返回 `forced:true`）。无未保存修改时投 WM_CLOSE 等待退出，超时未退出即报退出码 6 |
 | `sync_project` | `instance?`, `timeout_ms?` | 让 GMSave 立即检查磁盘改动并重载进 IDE 内存；run_* 已内置前置同步，单独确认同步结果时才需要调 |
-| `run_game` | `instance?`, `timeout_ms?`, `prefile?` | 前置同步后触发"正常运行"（F5）；返回新游戏进程 PID。`prefile` = `{file, content}`，确认触发后在游戏工作目录下落盘该相对路径文件（启动前写标记/约定文件的通用机制） |
-| `run_debug` | `instance?`, `timeout_ms?`, `prefile?` | 前置同步后触发"调试运行"（F6）；`prefile` 语义同 `run_game` |
+| `run_game` | `instance?`, `timeout_ms?`, `prefile?` | 前置同步后触发"正常运行"（F5），触发前授予静默租约；返回新游戏进程 PID。`prefile` = `{file, content}`，确认触发后在游戏工作目录下落盘该相对路径文件（启动前写标记/约定文件的通用机制） |
+| `run_debug` | `instance?`, `timeout_ms?`, `prefile?` | 前置同步后触发"调试运行"（F6），同样授予静默租约；`prefile` 语义同 `run_game` |
+| `save_project` | `instance?`, `timeout_ms?` | 触发"文件 > 保存"（等同 Ctrl+S，免前台）。保存前自动 `sync_project` 合并磁盘外部改动（结果在 `pre_sync`/`synced`），再授静默租约；完成判定 = 标题未保存标记消失。保存流程中被抑制的模态提示返回退出码 5 + `suppressed` 字段 |
 | `stop_game` | `instance?` / `pid?`, `grace_ms?` | 关闭该 IDE 启动的全部游戏（或 pid 指定的一个）：先 WM_CLOSE 优雅退出（宽限期内每 150ms 补发，兼容刚启动还没出现窗口的游戏），超时才 TerminateProcess；没有游戏时是成功无操作（幂等） |
-| `read_dialog` | `instance?`, `class_name?` | 读取该 IDE 及其游戏进程下的全部可见弹窗并枚举子控件（类名/文本/矩形/可见性），只读不点。默认三类：`TErrorForm`（IDE 错误框，正文可全文抓取）、`TMessageForm`（Delphi 消息框：游戏运行时错误/资源错误——正文画在窗体 Canvas 上不落子控件，只能拿标题+按钮，正文配截图）、`#32770`（Windows 标准对话框）。用于无人值守排查 `run_*` 失败原因；没有弹窗时正常返回 `count:0` |
+| `read_dialog` | `instance?`, `class_name?` | 读取该 IDE 及其游戏进程下的全部可见弹窗并枚举子控件（类名/文本/矩形/可见性），只读不点。默认三类：`TErrorForm`（IDE 错误框，正文可全文抓取）、`TMessageForm`（Delphi 消息框：游戏运行时错误/资源错误——正文画在窗体 Canvas 上不落子控件，只能拿标题+按钮，正文配截图）、`#32770`（Windows 标准对话框）。MCP 通道的提示由静默租约抑制（见上文），本工具用于排查游戏进程自己弹出的框或确认人工介入现场；没有弹窗时正常返回 `count:0` |
 | `action_info` | `query?`, `list?` | 查询 D&D 动作定义（数据源 = GM8 安装目录 `lib\*.lib`，262 条模板，已与 IDE 内存逐字段对照验证）：编号（"603"）查含义、名称/英文标签子串搜索（"执行代码"/"action_create_object"）、不传参数列全表。返回中文名、参数表（类型/标题/默认值）与可直接粘贴进对象 .gml 的 YYD ACTION 模板块。配套 `node server.mjs actions-md` 可重新生成全量速查文档 [ACTIONS.md](ACTIONS.md) |
 | `gmspr_unpack` | `file`, `out_dir?`, `overwrite?` | gmspr 精灵文件解包为 .gm80 工程同构的精灵文件夹（`0.png…+sprite.txt`，帧十进制编号不补零）：可直接拷进工程 `sprites/` 再登记 index.yyd/tree.yyd + sync_project；像素忠实导出，不做空白裁剪/颜色膨胀；返回尺寸/帧数/原点/碰撞/包围盒摘要 |
 | `gmspr_pack` | `dir`, `out_file?`, `overwrite?` | 精灵文件夹打包回 gmspr（运行时 `sprite_add_sprite`/`pic_load` 可加载，如外部内容包）：帧按 N.png 数字序（字典序会排错 10 与 2）；校验 frames 键与帧数一致、全帧同尺寸；缺 sprite.txt/字段非法报错不猜测 |
@@ -139,8 +159,9 @@ GM8 有两类工程，`get_project` / `status` 返回的 `format` 字段区分�
   分库（1xx=移动 2xx=主要一 3xx=主要二 4xx/6xx=控制 5xx=绘制 7xx=分数 8xx=高级）
   且全局唯一；两个汉化增强库 lib_id=740409。YYD ACTION 块的字段规则与 GMSave
   保存侧（gm80_save.cpp）一致，生成块已对真实工程 441 个现存动作块逐字节复刻验证。
-- **前置同步**：`run_*` 先同步再触发。同步被拒（退出码 5：IDE 有未应用的修改/冲突需人工
-  处理）或顺延/超时（退出码 6）时**不触发运行**——宁可不跑也不跑旧代码。
+- **前置同步**：`run_*` 与 `save_project` 先同步再触发。同步被拒（退出码 5：IDE 有未应用的
+  修改/冲突需人工处理）或顺延/超时（退出码 6）时 `run_*` **不触发运行**——宁可不跑也不跑旧代码；
+  `save_project` 不中止保存，把状态原样放进结果的 `pre_sync` 字段（`synced` 标记状态 1/2）。
 - **停止游戏**：`stop_game` 按 ppid 只关目标 IDE 自己启动的游戏。WM_CLOSE 让游戏走正常
   退出流程；`grace_ms`（默认 3000）内没退才强杀，杀掉的进程由 IDE 的运行管线正常感知
   退出并清理临时 exe。`grace_ms: 0` 跳过优雅退出直接杀。
@@ -162,7 +183,7 @@ node server.mjs run [--instance 序号|标题子串] [--timeout 毫秒] [--prefi
 node server.mjs debug [--instance 序号|标题子串] [--timeout 毫秒] [--prefile 相对路径=内容]
 node server.mjs stop [--instance 序号|标题子串] [--pid 进程号] [--grace 毫秒]
 node server.mjs open <工程路径> [--timeout 毫秒]
-node server.mjs close [--instance 序号|标题子串] [--timeout 毫秒]
+node server.mjs close [--instance 序号|标题子串] [--timeout 毫秒] [--discard-unsaved]
 node server.mjs action <编号|名称子串>       # 查 D&D 动作定义与 YYD ACTION 模板
 node server.mjs gmspr-unpack <文件.gmspr> [--out 目录] [--overwrite]
 node server.mjs gmspr-pack <精灵文件夹> [--out 文件.gmspr] [--overwrite]
@@ -173,16 +194,20 @@ node server.mjs mcp-selftest        # 校验 MCP SDK 依赖
 
 退出码：`0` 成功；`1` IDE 窗口不存在 / exe 找不到 / 启动失败；`2` 菜单项缺失/置灰；
 `3` 已触发但没等到游戏进程；`4` 多实例歧义（需指定 instance）；`5` 同步被拒需人工（run）/
-有进程未能停止（stop）；`6` 同步顺延/超时（未运行）/ IDE 未退出或工程未载入完成（close/open，
-多半弹了对话框等人工）；`7`（sync）同步通道不可用 /（stop）pid 不是正在运行的游戏 /
-（open）路径参数无效 / `8`（run/debug）prefile 落盘失败（未运行）/（sync）合并流失败
-（非顺延，勿盲目重试）。
+有进程未能停止（stop）/ IDE 有未保存修改被拒绝关闭或保存流程抑制了模态提示（close/save，
+close 可传 `--discard-unsaved` 强杀）/ 有模态对话框挡住保存（save）；`6` 同步顺延/超时
+（未运行）/ IDE 未退出或工程未载入完成（close/open，多半弹了对话框等人工）；
+`7`（sync）同步通道不可用 /（stop）pid 不是正在运行的游戏 /（open）路径参数无效 /
+`8`（run/debug）prefile 落盘失败（未运行）/（sync）合并流失败（非顺延，勿盲目重试）。
+`save` 的 `5` 附 `suppressed` 字段说明被抑制的是哪类提示（`save-disk-differs` /
+`save-failed` / `load-diagnostics` / `load-fatal` / `merge-editor-gate`）。
 
 ## 测试流程
 
 1. IDE 关闭 → `status` 应报 `instances: []`；
-2. 开两个 IDE（不同工程）→ `status` → 应列出 2 个实例，`gmsave_sync` 为 `ready`（新
-   GMSave）或 `no-channel`（旧 GMSave），`project.path` 与各实例实际打开的工程一致；
+2. 开两个 IDE（不同工程）→ `status` → 应列出 2 个实例，`gmsave_sync` 为
+   `ready+quiet`（支持静默租约的 GMSave）/ `ready`（旧 GMSave）/ `no-channel`（无通道），
+   `project.path` 与各实例实际打开的工程一致；
 3. 不带 `instance` 触发 `run` → 应退出码 4 并列出实例清单，不开游戏；
 4. `sync --instance <目标>` → 应返回 `reloaded` 或 `nothing-to-do`；
 5. 在磁盘上改一个工程文件（如脚本 `.gml`），再 `sync` → 应返回 `reloaded`，
@@ -204,5 +229,7 @@ node server.mjs mcp-selftest        # 校验 MCP SDK 依赖
 运行管线逆向地址（`RunGamePipeline` 等）记录在 `GMEnhance/gm80_addresses.h` 的
 Run-game pipeline 段；外部消息路线已验证可用，进程内直调那套地址留给未来需要
 读取编译错误文本/工程状态的工具使用。工程同步通道的状态码/detail 定义与 GMSave
-仓库 `project_watcher.cpp` 的 ForceSync 段注释一一对应，两边改协议要同步改。
+仓库 `project_watcher.cpp` 的 ForceSync 段注释一一对应，两边改协议要同步改；
+结果块 28 字节布局与 `GMSave.SetQuiet` 消息（租约毫秒数 / 0 = 清除）同属该协议，
+改一侧必须同步改另一侧。
 
